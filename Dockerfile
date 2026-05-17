@@ -1,18 +1,19 @@
-# Use the Ray image as the foundation
-FROM rayproject/ray:2.55.1-extra-py312-cu124
+# Use the slim Ray image (no "-extra") as the foundation
+FROM rayproject/ray:2.55.1-py312-cu124
 
-# Set environment variables
-ENV PIP_NO_CACHE_DIR=1
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    DEBIAN_FRONTEND=noninteractive
 
 USER root
-# Install git-lfs in case you need to verify model integrity later
-RUN apt-get update && apt-get install -y git-lfs && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git-lfs \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
+
 USER ray
-
-# Install dependencies
-# vLLM 0.19.1 and Scipy
-RUN pip install --upgrade pip && \
-    pip install "vllm==0.19.1" "scipy>=1.14.0"
-
-# Verify installation
-RUN python3 -c "import vllm; print('vLLM version:', vllm.__version__)"
+# Install vLLM + Scipy and verify in a single layer; clean pip/tmp caches afterwards
+RUN pip install --upgrade pip \
+    && pip install "vllm==0.19.1" "scipy>=1.14.0" \
+    && python3 -c "import vllm; print('vLLM version:', vllm.__version__)" \
+    && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
