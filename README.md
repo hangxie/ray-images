@@ -1,6 +1,9 @@
 # ray-vllm
 
-Ray image (`rayproject/ray`, slim) with vLLM installed, published as `hangxie/ray-vllm:<tag>`.
+Ray image (`rayproject/ray`, slim CPU variant) with vLLM installed, published as `hangxie/ray-vllm:<tag>`.
+
+The base has no CUDA toolkit: torch brings its CUDA runtime as pip wheels and the NVIDIA container
+toolkit mounts the driver. `gcc` is installed because Triton compiles small launcher stubs at runtime.
 
 ```bash
 make build
