@@ -13,6 +13,7 @@ all: build  ## build all default targets
 build:  ## build image
 	docker build . \
 		-f Dockerfile \
+		--build-arg VERSION=$(VERSION) \
 		-t hangxie/ray-vllm:$(VERSION)
 
 .PHONY: help

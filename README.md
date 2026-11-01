@@ -6,6 +6,13 @@ Ray image (`rayproject/ray`, slim) with vLLM installed, published as `hangxie/ra
 make build
 ```
 
+Image tags are this repo's own `vX.Y.Z`. The upstream versions are set as `ARG`s at the top of the
+`Dockerfile` and recorded as image labels:
+
+```bash
+docker inspect -f '{{json .Config.Labels}}' hangxie/ray-vllm:<tag>
+```
+
 ## Loading weights from S3
 
 vLLM is installed with its `runai` extra, so the Run:ai Model Streamer and its S3 backend
