@@ -5,16 +5,42 @@ Ray image (`rayproject/ray`, slim CPU variant) with vLLM installed, published as
 The base has no CUDA toolkit: torch brings its CUDA runtime as pip wheels and the NVIDIA container
 toolkit mounts the driver. `gcc` is installed because Triton compiles small launcher stubs at runtime.
 
+FlashInfer's matching prebuilt cubins and CUDA 13.0 JIT-cache wheels are included so the default
+vLLM sampler can load its kernel without `nvcc`. The build checks that the sampler binary is present
+for an `sm_86` architecture target. Keep `FLASHINFER_VERSION` in the `Dockerfile` aligned with
+`flashinfer-python`, and update the cache's CUDA suffix when torch's CUDA runtime changes.
+Prebuilt kernels cover the upstream wheel's supported configurations; other configurations can still
+require JIT compilation and a CUDA toolkit. GPU execution must be validated on the target hardware.
+
 ```bash
 make build
 ```
 
 Image tags are this repo's own `vX.Y.Z`. The upstream versions are set as `ARG`s at the top of the
-`Dockerfile` and recorded as image labels:
+`Dockerfile` and recorded as image labels. Ray 2.59.0 is paired with vLLM 0.27.0,
+matching Ray Serve LLM's exact vLLM requirement. The base remains the slim
+`rayproject/ray:2.59.0-py312-cpu` image; torch supplies the CUDA runtime.
+
+Upgrading changes the compile and Triton cache keys, so expect a cold first start.
+Revalidate model-specific engine settings and tool-call parsers before rollout.
+
+Inspect the version labels with:
 
 ```bash
 docker inspect -f '{{json .Config.Labels}}' hangxie/ray-vllm:<tag>
 ```
+
+## FlashInfer sampler smoke test
+
+Run this on a GPU host to check the prebuilt sampler without allowing an nvcc fallback:
+
+```bash
+docker run --rm --gpus all -e FLASHINFER_DISABLE_JIT=1 hangxie/ray-vllm:<tag> \
+  python3 -c "import torch; from flashinfer.sampling import top_k_top_p_sampling_from_probs; p = torch.full((4, 128), 1 / 128, device='cuda'); s = top_k_top_p_sampling_from_probs(p, 16, 0.9); torch.cuda.synchronize(); assert s.shape == (4,) and ((s >= 0) & (s < 128)).all().item(); print('FlashInfer sampler OK')"
+```
+
+The driver (`libcuda.so.1`) must be mounted by the NVIDIA container runtime. A CPU-only build
+can check that the cache exists, but cannot load or execute its CUDA kernels.
 
 ## Loading weights from S3
 
