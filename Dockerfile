@@ -8,10 +8,8 @@ FROM rayproject/ray:${RAY_VERSION}-py312-cpu
 
 ARG RAY_VERSION
 ARG VLLM_VERSION
-ARG VERSION=dev
 
 LABEL org.opencontainers.image.source="https://github.com/hangxie/ray-vllm" \
-      org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.base.name="rayproject/ray:${RAY_VERSION}-py312-cpu" \
       io.github.hangxie.ray-vllm.ray-version="${RAY_VERSION}" \
       io.github.hangxie.ray-vllm.vllm-version="${VLLM_VERSION}"
@@ -41,3 +39,7 @@ RUN pip install --upgrade pip \
          -I"$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["include"])')" \
          -I"$(python3 -c 'import os, triton; print(os.path.join(os.path.dirname(triton.__file__), "backends/nvidia/include"))')" \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
+
+# Last, so a new version only changes image metadata and keeps the build cache
+ARG VERSION=dev
+LABEL org.opencontainers.image.version="${VERSION}"

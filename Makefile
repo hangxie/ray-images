@@ -13,6 +13,7 @@ all: build  ## build all default targets
 build:  ## build image
 	docker build . \
 		-f Dockerfile \
+		--platform linux/amd64 \
 		--build-arg VERSION=$(VERSION) \
 		-t hangxie/ray-vllm:$(VERSION)
 
