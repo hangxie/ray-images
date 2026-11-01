@@ -12,8 +12,9 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /tmp/* /var/tmp/*
 
 USER ray
-# Install vLLM + Scipy and verify in a single layer; clean pip/tmp caches afterwards
+# Install vLLM (with the Run:ai Model Streamer for s3:// weights) + Scipy and verify in a single layer;
+# clean pip/tmp caches afterwards
 RUN pip install --upgrade pip \
-    && pip install "vllm==0.19.1" "scipy>=1.14.0" \
-    && python3 -c "import vllm; print('vLLM version:', vllm.__version__)" \
+    && pip install "vllm[runai]==0.19.1" "scipy>=1.14.0" \
+    && python3 -c "import vllm, runai_model_streamer, runai_model_streamer_s3; print('vLLM version:', vllm.__version__)" \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
