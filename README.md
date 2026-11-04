@@ -1,4 +1,4 @@
-# ray-vllm
+# ray-images
 
 Ray image (`rayproject/ray`, slim CPU variant) with vLLM installed, published as `hangxie/ray-vllm:<tag>`.
 
