@@ -6,6 +6,7 @@ The head, LLM workers, and TTS workers all run this one image, so the Ray versio
 
 ```text
 Dockerfile                  the image
+scripts/                    build-time helpers (FlashInfer cache pruning)
 tts/app/                    Serve app (serve_tts.py, index.html), importable as serve_tts:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 ```
@@ -36,6 +37,7 @@ FlashInfer's CUDA 13.0 JIT-cache wheel is included, so the default sampler loads
 - The optional `flashinfer-cubin` bundle is omitted to save space. Operations that need it download cubins on demand and need network access.
 - Keep `FLASHINFER_VERSION` aligned with `flashinfer-python`, and update the cache's CUDA suffix when torch's CUDA runtime changes.
 - Configurations outside the prebuilt set can still need JIT compilation and a CUDA toolkit.
+- Cached modules that none of `FLASHINFER_KEEP_ARCHS` (default `8.6`) can run are deleted at build time by `scripts/prune_flashinfer_cache.py`, saving about 0.9 GB (0.5 GB compressed). It reads each module's embedded GPU code and drops whole modules with nothing for those architectures: on those GPUs they would only fail. Before deploying to other GPUs, add their architecture (`--build-arg FLASHINFER_KEEP_ARCHS="8.6 8.9"`) or keep everything with `all`.
 
 Smoke test on a GPU host, with the nvcc fallback disabled:
 
