@@ -52,6 +52,12 @@ RUN pip install "flashinfer-python==${FLASHINFER_VERSION}" \
     && FLASHINFER_CUDA_ARCH_LIST=8.6 FLASHINFER_DISABLE_JIT=1 python3 -c "from flashinfer.jit.sampling import gen_sampling_module; spec = gen_sampling_module(); assert spec.is_aot, 'Prebuilt FlashInfer sampler is missing'; print('Prebuilt FlashInfer sampler:', spec.aot_path)" \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
+# The base ships Brotli 1.1, but huggingface_hub's HTTP client passes output_buffer_limit to brotli's Decompressor,
+# which needs 1.2: without it `hf download` fails on brotli-encoded files such as a tokenizer's vocab.json.
+RUN pip install "brotli>=1.2" \
+    && pip check \
+    && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
+
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev
 LABEL org.opencontainers.image.version="${VERSION}"

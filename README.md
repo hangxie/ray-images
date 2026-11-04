@@ -5,6 +5,8 @@ Ray image (`rayproject/ray`, slim CPU variant) with vLLM installed, published as
 The base has no CUDA toolkit: torch brings its CUDA runtime as pip wheels and the NVIDIA container
 toolkit mounts the driver. `gcc` is installed because Triton compiles small launcher stubs at runtime.
 
+The base's Brotli 1.1 is upgraded to 1.2: `huggingface_hub`'s HTTP client needs it, or `hf download` fails on brotli-encoded files such as a tokenizer's `vocab.json`.
+
 FlashInfer's full CUDA 13.0 JIT-cache wheel is included so the default vLLM sampler can load its
 kernel without `nvcc`. The optional `flashinfer-cubin` bundle is omitted to reduce image size;
 operations that need those cubins download them on demand and require network access.
