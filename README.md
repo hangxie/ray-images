@@ -93,7 +93,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 |---|---|---|
 | `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model ID reported by `/health`; loaded from the Hub if `TTS_MODEL_DIR` is unset |
 | `TTS_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
-| `TTS_VOICES_DIR` | `/home/ray/tts/voices` | WAV + `.txt` transcript pairs, re-read per request |
+| `TTS_VOICES_DIR` | `/home/ray/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
 | `TTS_NUM_REPLICAS` | `2` | Replicas, one GPU each |
 | `TTS_MAX_QUEUED_REQUESTS` | `4` | Requests Serve queues before answering 503 |
 | `TTS_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for TTS replicas (`py_executable`) |
@@ -110,6 +110,7 @@ Each replica asks for `num_gpus: 1` plus a custom `tts: 1` resource and handles 
 
 - `/health`, `/voices`, and `/` are requests too, so they wait in the same queue while every replica is synthesizing.
 - The model loads in bf16 on `cuda:0`. Startup fails unless it is a Base model whose speech tokenizer has an encoder.
+- At startup, each voice's reference is encoded once into a voice-clone prompt (speech-tokenizer codes plus speaker embedding), logged as `Encoded N voice prompts in X s`. Requests reuse it instead of re-encoding the WAV. A voice that fails to encode is logged and skipped; it returns the same error per request as before.
 - There is no client-IP allowlist; access control belongs to the Gateway.
 
 ### Decoding speed
