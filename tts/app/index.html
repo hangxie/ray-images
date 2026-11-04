@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ray-tts</title>
+<style>
+body {font: 16px system-ui, sans-serif; max-width: 760px; margin: 2rem auto; padding: 0 1rem; color: #18212c; background: #f8fafc}
+textarea, select, button, input {font: inherit; padding: .6rem; border: 1px solid #b7c3d0; border-radius: .4rem}
+textarea, audio {width: 100%; box-sizing: border-box}
+button {background: #173b63; color: white; cursor: pointer} button:disabled {opacity: .6} #stop {background: #6b7785}
+section {background: white; padding: 1.2rem; margin: 1rem 0; border-radius: .6rem; border: 1px solid #dce3eb}
+select {max-width: 100%} #message, .warn {color: #a32222} .muted {color: #526173; font-size: .9rem}
+details {margin: .8rem 0} summary {cursor: pointer} #settings label {display: inline-block; margin: .3rem 1rem .3rem 0} #settings input {width: 5.5rem}
+#pieces {padding-left: 1.6rem} #pieces li {margin: .5rem 0} #pieces li.playing {font-weight: 600} #pieces audio {height: 2rem; margin-top: .2rem}
+</style>
+<h1>ray-tts</h1>
+<p id="model" class="muted">Loading model details…</p>
+<section>
+<h2>Generate speech</h2>
+<form id="form">
+<p><label>Reference voice <select id="voice" required></select></label></p>
+<p><label for="text">Text to speak</label></p>
+<textarea id="text" rows="6" required placeholder="Text to speak in the selected reference voice."></textarea>
+<p><label>Seed <input id="seed" type="number" min="0" max="4294967295" value="0" style="width: 6rem"></label> <label>Speed <input id="speed" type="number" style="width: 4.5rem"></label> <label>Volume <input id="volume" type="number" style="width: 4.5rem"> LUFS</label> <label><input id="split" type="checkbox" style="padding: 0"> Split into paragraphs</label> <button id="submit">Generate</button> <button id="stop" type="button" hidden>Stop</button></p>
+<p class="muted">Speed re-times the finished audio while preserving pitch. Volume is the output loudness in LUFS every voice is normalized to, so each one plays at the same level; a louder target is capped to avoid clipping. Neither changes how the voice is generated.</p>
+<details><summary>Generation settings</summary><div id="settings"><label>Language <select id="language"></select></label></div>
+<p><button id="reset" type="button">Reset to defaults</button></p>
+<p class="muted">Lower temperature or top-p makes delivery steadier and split paragraphs more alike, but flatter; very low values can cause repetition. Top-k 0 disables it. Max tokens caps each request at 12.5 tokens per second of audio; left empty, it is set from the text length at about twice normal speech. Set it for text that runs long when spoken, such as acronyms.</p></details>
+</form>
+<p id="stats" class="muted"></p><p id="message" role="status"></p>
+<ol id="pieces"></ol>
+</section>
+
+<p class="muted">With splitting on, each paragraph (line) is generated as its own request, one at a time, and plays in order as it returns. Check voice similarity, naturalness, missing or repeated words, glitches, seams between paragraphs, and the ending. Reference clips use their matching transcript. Audio is generated on the homelab GPU; live results stay in the browser.</p>
+<script>
+const $ = id => document.getElementById(id);
+const PARAGRAPH_PAUSE = 0.5;
+const LABELS = {temperature: 'Temperature', top_k: 'Top-k', top_p: 'Top-p', repetition_penalty: 'Repetition penalty', max_tokens: 'Max tokens'};
+let run, sampling = {}, speedDefault = 1, volumeDefault = -20;
+const describe = r => `${Number(r.audio_seconds).toFixed(2)} s audio in ${Number(r.wall_seconds).toFixed(2)} s · RTF ${Number(r.rtf).toFixed(3)}`;
+async function initialize() {
+  const [health, voices] = await Promise.all(['health', 'voices'].map(async url => {
+    const response = await fetch(url); if (!response.ok) throw new Error('Unable to load test page data'); return response.json();
+  }));
+  $('model').textContent = health.model + ' · ' + health.device;
+  for (const language of health.languages) $('language').add(new Option(language, language));
+  Object.assign($('speed'), {min: health.speed.min, max: health.speed.max, step: 0.05, value: health.speed.default});
+  speedDefault = health.speed.default;
+  Object.assign($('volume'), {min: health.volume.min, max: health.volume.max, step: 1, value: health.volume.default});
+  volumeDefault = health.volume.default;
+  sampling = health.sampling;
+  for (const [name, range] of Object.entries(sampling)) {
+    const label = document.createElement('label'), input = document.createElement('input');
+    Object.assign(input, {id: name, type: 'number', min: range.min, max: range.max, step: range.integer ? 1 : 0.05, value: range.default ?? '', required: range.default !== null, placeholder: range.default === null ? 'auto' : ''});
+    label.append(LABELS[name] + ' ', input); $('settings').append(label);
+  }
+  for (const voice of voices) $('voice').add(new Option(voice, voice));
+  if (voices.includes('hang-en')) $('voice').value = 'hang-en';
+  if (!voices.length) { $('submit').disabled = true; $('message').textContent = 'No reference WAVs with matching transcripts are available.'; }
+}
+// Android Chrome drops an in-flight request when the page goes to the background, and may leave it unsettled until the
+// page returns. A request that was in flight while hidden is resent on return, and a dropped or busy (503) one is retried
+// until Stop; the service abandons a synthesis whose client has gone, so the retry is not left waiting on it.
+async function synthesize(current, body, info) {
+  for (let retry = false; ; retry = true) {
+    if (retry) { info.textContent = 'Connection lost; retrying…'; await new Promise(resolve => setTimeout(resolve, 1000)); }
+    if (run !== current) throw new DOMException('Stopped', 'AbortError');
+    const attempt = current.attempt = new AbortController();
+    attempt.hidden = document.hidden;
+    try {
+      const response = await fetch('api/tts', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: AbortSignal.any([current.controller.signal, attempt.signal]), body});
+      if (response.status === 409 || response.status === 503) continue;
+      if (!response.ok) throw new Error((await response.json()).error);
+      return {response, blob: await response.blob()};
+    } catch (error) {
+      if (current.controller.signal.aborted || !(error instanceof TypeError || attempt.signal.aborted)) throw error;
+    }
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { if (run?.attempt) run.attempt.hidden = true; }
+  else if (run?.attempt?.hidden) run.attempt.abort();
+});
+function stop() {
+  if (!run) return;
+  run.controller.abort(); run.context.close(); run.timers.forEach(clearTimeout); run.urls.forEach(URL.revokeObjectURL); run = undefined;
+}
+$('reset').addEventListener('click', () => { $('language').value = 'auto'; $('speed').value = speedDefault; $('volume').value = volumeDefault; for (const [name, range] of Object.entries(sampling)) $(name).value = range.default ?? ''; });
+$('stop').addEventListener('click', () => { stop(); $('message').textContent = 'Stopped.'; });
+$('form').addEventListener('submit', async event => {
+  event.preventDefault(); stop();
+  const text = $('text').value, pieces = ($('split').checked ? text.split('\n') : [text]).map(piece => piece.trim()).filter(Boolean);
+  if (!pieces.length) return;
+  // Create the audio context inside the click so later pieces can start without another gesture.
+  const current = run = {controller: new AbortController(), context: new AudioContext(), timers: [], urls: []};
+  const {context} = current, started = performance.now();
+  $('submit').disabled = true; $('submit').textContent = 'Generating…'; $('stop').hidden = false;
+  $('message').textContent = ''; $('stats').textContent = ''; $('pieces').replaceChildren();
+  const items = pieces.map(piece => {
+    const item = document.createElement('li'), text = document.createElement('div'), info = document.createElement('div');
+    text.textContent = piece; info.className = 'muted'; info.textContent = 'Waiting';
+    item.append(text, info); $('pieces').append(item); return {item, info};
+  });
+  let next = 0, firstAudio, audioSeconds = 0, synthesisSeconds = 0, limited = 0;
+  try {
+    for (const [i, piece] of pieces.entries()) {
+      items[i].info.textContent = 'Generating…';
+      const body = JSON.stringify({text: piece, voice: $('voice').value, seed: Number($('seed').value), speed: Number($('speed').value), volume: Number($('volume').value), language: $('language').value, ...Object.fromEntries(Object.keys(sampling).filter(name => $(name).value !== '').map(name => [name, Number($(name).value)]))});
+      const {response, blob} = await synthesize(current, body, items[i].info).catch(error => { throw error.name === 'AbortError' ? error : new Error(`Piece ${i + 1}: ${error.message}`); });
+      const buffer = await context.decodeAudioData(await blob.arrayBuffer());
+      if (run !== current) return;
+      const source = context.createBufferSource(); source.buffer = buffer; source.connect(context.destination);
+      const at = Math.max(next, context.currentTime) + (i ? PARAGRAPH_PAUSE : 0);
+      source.start(at); next = at + buffer.duration;
+      current.timers.push(setTimeout(() => { items.forEach(x => x.item.classList.remove('playing')); items[i].item.classList.add('playing'); }, (at - context.currentTime) * 1000));
+      source.onended = () => items[i].item.classList.remove('playing');
+      firstAudio ??= (performance.now() - started) / 1000;
+      const url = URL.createObjectURL(blob); current.urls.push(url);
+      const audio = document.createElement('audio'); audio.controls = true; audio.src = url;
+      const header = name => response.headers.get(name);
+      items[i].info.textContent = describe({audio_seconds: header('X-Audio-Seconds'), wall_seconds: header('X-Synthesis-Seconds'), rtf: header('X-RTF')});
+      if (header('X-Token-Limited') === 'true') { limited++; items[i].info.classList.add('warn'); items[i].info.textContent += ' · hit the token limit'; }
+      items[i].item.append(audio);
+      audioSeconds += Number(header('X-Audio-Seconds')); synthesisSeconds += Number(header('X-Synthesis-Seconds'));
+      $('stats').textContent = `${i + 1}/${pieces.length} pieces · first audio after ${firstAudio.toFixed(2)} s · ` + describe({audio_seconds: audioSeconds, wall_seconds: synthesisSeconds, rtf: synthesisSeconds / audioSeconds});
+    }
+    if (limited) $('message').textContent = `${limited} piece(s) hit the token limit. Check them for repetition or a cut-off ending.`;
+  } catch (error) { if (run === current) $('message').textContent = error.message; }
+  finally {
+    if (run === current || !run) { $('submit').disabled = false; $('submit').textContent = 'Generate'; }
+    // Keep Stop available until the queued audio has finished playing.
+    if (run === current) current.timers.push(setTimeout(() => { if (run === current) $('stop').hidden = true; }, Math.max(0, next - context.currentTime) * 1000));
+    else if (!run) $('stop').hidden = true;
+  }
+});
+initialize().catch(error => $('message').textContent = error.message);
+</script>
+</html>
