@@ -9,10 +9,10 @@ FROM rayproject/ray:${RAY_VERSION}-py312-cpu
 ARG RAY_VERSION
 ARG VLLM_VERSION
 
-LABEL org.opencontainers.image.source="https://github.com/hangxie/ray-vllm" \
+LABEL org.opencontainers.image.source="https://github.com/hangxie/ray-images" \
       org.opencontainers.image.base.name="rayproject/ray:${RAY_VERSION}-py312-cpu" \
-      io.github.hangxie.ray-vllm.ray-version="${RAY_VERSION}" \
-      io.github.hangxie.ray-vllm.vllm-version="${VLLM_VERSION}"
+      io.github.hangxie.ray-images.ray-version="${RAY_VERSION}" \
+      io.github.hangxie.ray-images.vllm-version="${VLLM_VERSION}"
 
 # The CPU base doesn't set these; without "compute" the container toolkit may not mount libcuda
 ENV PIP_NO_CACHE_DIR=1 \
