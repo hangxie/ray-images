@@ -45,10 +45,15 @@ RUN pip install --upgrade pip \
 # FlashInfer otherwise JIT-compiles the sampler and needs nvcc, which the CPU base lacks.
 # Keep the JIT cache on the same release as flashinfer-python and match torch's CUDA runtime.
 # Omit the large optional cubin bundle; other cubins can be downloaded on demand.
+# Drop cached modules none of FLASHINFER_KEEP_ARCHS can run (about 0.9 GB for 8.6); add an arch or use "all" before
+# deploying to other GPUs. Pruned in this layer, since a later one could not shrink it.
 ARG FLASHINFER_VERSION=0.6.16.post3
+ARG FLASHINFER_KEEP_ARCHS=8.6
+COPY --chown=ray:users scripts/prune_flashinfer_cache.py /tmp/prune_flashinfer_cache.py
 RUN pip install "flashinfer-python==${FLASHINFER_VERSION}" \
     && pip install "flashinfer-jit-cache==${FLASHINFER_VERSION}+cu130" --index-url https://flashinfer.ai/whl/cu130 \
     && pip check \
+    && python3 /tmp/prune_flashinfer_cache.py ${FLASHINFER_KEEP_ARCHS} \
     && FLASHINFER_CUDA_ARCH_LIST=8.6 FLASHINFER_DISABLE_JIT=1 python3 -c "from flashinfer.jit.sampling import gen_sampling_module; spec = gen_sampling_module(); assert spec.is_aot, 'Prebuilt FlashInfer sampler is missing'; print('Prebuilt FlashInfer sampler:', spec.aot_path)" \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
