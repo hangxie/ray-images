@@ -58,6 +58,29 @@ RUN pip install "brotli>=1.2" \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
+# Qwen3-TTS runs in its own virtualenv because qwen-tts pins transformers==4.57.3, which vLLM rules out. The venv
+# inherits the system packages (Ray, torch, CUDA libraries) and adds only what qwen-tts needs on top; torch/torchaudio
+# are constrained to the system versions so no second copy is installed. TTS replicas run its interpreter through
+# runtime_env py_executable (tts/app/serve_tts.py). Kept after the vLLM layers so a TTS change rebuilds only this.
+ARG QWEN_TTS_VERSION=0.1.1
+LABEL io.github.hangxie.ray-images.qwen-tts-version="${QWEN_TTS_VERSION}"
+COPY --chown=ray:users tts/check_requirements.py /tmp/check_requirements.py
+RUN python3 -m venv --system-site-packages /home/ray/tts-venv \
+    && pip list --format=freeze | grep -E '^(torch|torchaudio)==' > /tmp/constraints.txt \
+    && /home/ray/tts-venv/bin/pip install --constraint /tmp/constraints.txt \
+       "qwen-tts==${QWEN_TTS_VERSION}" "scipy>=1.14.0" soundfile \
+    && /home/ray/tts-venv/bin/python /tmp/check_requirements.py "qwen-tts==${QWEN_TTS_VERSION}" scipy soundfile \
+    && pip check \
+    && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
+
+# The Serve app, importable as serve_tts:app: the head builds it with the system Python, replicas run it in the venv.
+# pyarrow (from the base image, unused here) is blocked for the checks because its native library segfaults under
+# amd64 emulation on Apple Silicon; ray.serve and qwen_tts import fine without it.
+COPY --chown=ray:users tts/app/ /home/ray/tts/
+ENV PYTHONPATH=/home/ray/tts${PYTHONPATH:+:${PYTHONPATH}}
+RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, transformers; print('Serve app:', serve_tts.app, 'system transformers', transformers.__version__)" \
+    && /home/ray/tts-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts; assert transformers.__version__ == '4.57.3', transformers.__version__; print('TTS venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
+
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev
 LABEL org.opencontainers.image.version="${VERSION}"
