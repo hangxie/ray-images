@@ -270,10 +270,33 @@ class TTS:
             seconds = warm_up(self.tts)
             logger.info("CUDA graphs captured in %.1f s; talker KV cache %d tokens, %.2f GB CUDA allocated", seconds,
                         settings["kv_cache_tokens"], torch.cuda.memory_allocated() / 1e9)
+        # Reference prompts (speech-tokenizer codes + speaker embedding) per voice, encoded once here instead of on
+        # every request. Keyed by the pair's mtimes, so a replaced WAV or transcript is re-encoded on next use.
+        self.prompts = {}
+        started = time.perf_counter()
+        for voice in voices(self.voices_dir):
+            try:
+                self.prompt(voice)
+            except Exception as exc:  # e.g. an empty transcript or unreadable WAV: that voice fails per request, as before
+                logger.warning("Voice %s not cached: %s", voice, exc)
+        logger.info("Encoded %d voice prompts in %.1f s", len(self.prompts), time.perf_counter() - started)
         self.languages = ["auto", *sorted(set(self.tts.get_supported_languages()) - {"auto"})]
         self.sampling = {name: (t, d if d is None or name not in defaults else t(defaults[name]), lo, hi)
                          for name, (t, d, lo, hi) in SAMPLING.items()}
         self.device = f"{torch.cuda.get_device_name(model.device)} / CUDA {torch.version.cuda}"
+
+    def prompt(self, voice):
+        """The cached voice-clone prompt for `voice`, encoding it on first use or after its files change."""
+        wav, txt = self.voices_dir / f"{voice}.wav", self.voices_dir / f"{voice}.txt"
+        stamp = (wav.stat().st_mtime_ns, txt.stat().st_mtime_ns)
+        cached = self.prompts.get(voice)
+        if cached is None or cached[0] != stamp:
+            transcript = txt.read_text(encoding="utf-8")
+            if not transcript.strip():
+                raise ValueError("Reference transcript is empty")
+            cached = stamp, self.tts.create_voice_clone_prompt(ref_audio=str(wav), ref_text=transcript)
+            self.prompts[voice] = cached
+        return cached[1]
 
     @api.get("/")
     def page(self):
@@ -354,9 +377,7 @@ class TTS:
         import torch
 
         self.job = job
-        transcript = (self.voices_dir / f"{voice}.txt").read_text(encoding="utf-8")
-        if not transcript.strip():
-            raise ValueError("Reference transcript is empty")
+        prompt = self.prompt(voice)
         greedy = sampling["temperature"] == 0
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -366,7 +387,7 @@ class TTS:
         # Unset options fall back to generation_config.json; greedy decoding leaves temperature at that default unused.
         wavs, sample_rate = self.tts.generate_voice_clone(
             text=text, language="Auto" if language == "auto" else language,
-            ref_audio=str(self.voices_dir / f"{voice}.wav"), ref_text=transcript,
+            voice_clone_prompt=prompt,
             do_sample=not greedy, temperature=None if greedy else sampling["temperature"],
             top_k=sampling["top_k"], top_p=sampling["top_p"], repetition_penalty=sampling["repetition_penalty"],
             max_new_tokens=sampling["max_tokens"],
