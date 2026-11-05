@@ -8,6 +8,7 @@ have; torch, transformers and qwen_tts load inside the replica.
 
 import asyncio
 import contextlib
+import hmac
 import io
 import json
 import logging
@@ -72,12 +73,28 @@ def settings():
     replica process does not see the application's env_vars, and module-level globals there would fall back to defaults.
     """
     return {
+        "api_key_file": os.environ.get("TTS_API_KEY_FILE", "/var/run/secrets/tts-api-key/token"),
         "model": os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         "model_dir": os.environ.get("TTS_MODEL_DIR"),  # local copy of the model; the Hub ID is used when unset
         "voices_dir": os.environ.get("TTS_VOICES_DIR", str(ROOT / "voices")),
         "cuda_graphs": os.environ.get("TTS_CUDA_GRAPHS", "1") != "0",
         "kv_cache_tokens": int(os.environ.get("TTS_KV_CACHE_TOKENS", "3072")),
     }
+
+
+def read_api_key(path):
+    """Read the mounted Secret in the replica, never into Serve's serialized bind arguments."""
+    key = Path(path).read_bytes().strip()
+    if not key:
+        raise RuntimeError("TTS API key file is empty")
+    return key
+
+
+def authenticated(request, path):
+    # Re-read the projected Secret so key rotation takes effect without restarting GPU replicas.
+    key = read_api_key(path)
+    parts = request.headers.get("Authorization", "").split()
+    return len(parts) == 2 and parts[0].lower() == "bearer" and hmac.compare_digest(parts[1].encode(), key)
 
 
 def replica_runtime_env():
@@ -244,6 +261,9 @@ def hook_talker(model, current, prepare=None):
 @serve.ingress(api)
 class TTS:
     def __init__(self, settings):
+        self.api_key_file = settings["api_key_file"]
+        read_api_key(self.api_key_file)  # Fail closed before loading the model if the Secret is absent or empty.
+
         import torch
         from qwen_tts import Qwen3TTSModel
 
@@ -318,6 +338,8 @@ class TTS:
 
     @api.post("/api/tts")
     async def synthesize(self, request: Request):
+        if not authenticated(request, self.api_key_file):
+            return reply(401, {"error": "Missing or invalid API token"}, headers={"WWW-Authenticate": "Bearer"})
         try:
             body = await request.body()
             if not 0 < len(body) <= 100_000:

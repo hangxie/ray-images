@@ -18,6 +18,8 @@ details {margin: .8rem 0} summary {cursor: pointer} #settings label {display: in
 <section>
 <h2>Generate speech</h2>
 <form id="form">
+<p><label>API token <input id="api-token" type="password" required autocomplete="off" spellcheck="false" placeholder="TTS API token"></label></p>
+<p class="muted">The token is kept only in this page and sent with speech requests. Re-enter it after reloading.</p>
 <p><label>Reference voice <select id="voice" required></select></label></p>
 <p><label for="text">Text to speak</label></p>
 <textarea id="text" rows="6" required placeholder="Text to speak in the selected reference voice."></textarea>
@@ -68,7 +70,7 @@ async function synthesize(current, body, info) {
     const attempt = current.attempt = new AbortController();
     attempt.hidden = document.hidden;
     try {
-      const response = await fetch('api/tts', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: AbortSignal.any([current.controller.signal, attempt.signal]), body});
+      const response = await fetch('api/tts', {method: 'POST', headers: {'Content-Type': 'application/json', Authorization: `Bearer ${current.token}`}, signal: AbortSignal.any([current.controller.signal, attempt.signal]), body});
       if (response.status === 409 || response.status === 503) continue;
       if (!response.ok) throw new Error((await response.json()).error);
       return {response, blob: await response.blob()};
@@ -92,7 +94,7 @@ $('form').addEventListener('submit', async event => {
   const text = $('text').value, pieces = ($('split').checked ? text.split('\n') : [text]).map(piece => piece.trim()).filter(Boolean);
   if (!pieces.length) return;
   // Create the audio context inside the click so later pieces can start without another gesture.
-  const current = run = {controller: new AbortController(), context: new AudioContext(), timers: [], urls: []};
+  const current = run = {token: $('api-token').value.trim(), controller: new AbortController(), context: new AudioContext(), timers: [], urls: []};
   const {context} = current, started = performance.now();
   $('submit').disabled = true; $('submit').textContent = 'Generating…'; $('stop').hidden = false;
   $('message').textContent = ''; $('stats').textContent = ''; $('pieces').replaceChildren();

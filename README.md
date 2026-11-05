@@ -81,16 +81,25 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 
 ### Endpoints
 
-`GET /` (page), `GET /health`, `GET /voices`, and `POST /api/tts` keep the MLX service's fields, ranges, error codes, and headers, so its `index.html` and `txt2mp3.sh` work unchanged. Point `TTS_URL` at the new endpoint.
+`GET /` (page), `GET /health`, `GET /voices`, and `POST /api/tts` keep the MLX service's fields, ranges, error codes, and headers, so clients can use the same payloads. Point `TTS_URL` at the new endpoint and send `Authorization: Bearer <token>` with every synthesis request; clients such as `txt2mp3.sh` must supply that header.
 
 - `X-Peak-CUDA-GB` replaces `X-Peak-MLX-GB`, and `/health` reports the CUDA device.
+- `POST /api/tts` requires a bearer token and returns `401` with `WWW-Authenticate: Bearer` for missing or invalid tokens, before reading the request body. The token comes from the file at `TTS_API_KEY_FILE`, read inside each replica; a missing or empty file fails startup before loading the model. Projected Secret updates take effect on the next request without a replica restart. The token is never put in Serve configuration or bind arguments.
+- The page has a masked API-token input. It keeps the token in page memory only and includes it in every synthesis request, including retries. The homelab protects the page and metadata endpoints with Zitadel separately from API bearer authentication.
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
+
+CPU authentication checks run against the built image without starting Ray or loading a GPU model:
+
+```bash
+docker run --rm -i hangxie/ray-images:<tag> python3 -c "import sys; sys.modules['pyarrow'] = None; exec(sys.stdin.read())" < tts/test_auth.py
+```
 
 ### Settings
 
 | Setting | Default | Effect |
 |---|---|---|
+| `TTS_API_KEY_FILE` | `/var/run/secrets/tts-api-key/token` | Required nonempty bearer-token file, mounted into every TTS replica |
 | `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model ID reported by `/health`; loaded from the Hub if `TTS_MODEL_DIR` is unset |
 | `TTS_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
 | `TTS_VOICES_DIR` | `/home/ray/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
@@ -111,7 +120,7 @@ Each replica asks for `num_gpus: 1` plus a custom `tts: 1` resource and handles 
 - `/health`, `/voices`, and `/` are requests too, so they wait in the same queue while every replica is synthesizing.
 - The model loads in bf16 on `cuda:0`. Startup fails unless it is a Base model whose speech tokenizer has an encoder.
 - At startup, each voice's reference is encoded once into a voice-clone prompt (speech-tokenizer codes plus speaker embedding), logged as `Encoded N voice prompts in X s`. Requests reuse it instead of re-encoding the WAV. A voice that fails to encode is logged and skipped; it returns the same error per request as before.
-- There is no client-IP allowlist; access control belongs to the Gateway.
+- There is no client-IP allowlist. The application enforces bearer authentication for synthesis, including direct in-cluster calls; the Gateway and its OIDC proxy protect the UI and metadata endpoints.
 
 ### Decoding speed
 
