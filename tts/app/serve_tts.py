@@ -7,7 +7,9 @@ have; torch, transformers and qwen_tts load inside the replica.
 """
 
 import asyncio
+import base64
 import contextlib
+import functools
 import io
 import json
 import logging
@@ -19,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import scipy.signal
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.exceptions import HTTPException
 
@@ -47,6 +49,11 @@ SPEED_DEFAULT, SPEED_MIN, SPEED_MAX = 1.0, 0.5, 2.0
 # so every voice comes out at one volume; a louder target is capped so the waveform never clips.
 VOLUME_DEFAULT, VOLUME_MIN, VOLUME_MAX = -20.0, -40.0, -9.0
 PEAK_CEILING = 10 ** (-1.0 / 20)  # leave 1 dB of headroom below full scale when gaining up
+# A streamed request sends audio every this many codec frames (12.5 Hz, so about a second) as they are generated.
+STREAM_FRAMES = 12
+# Frames the vocoder re-runs in front of each streamed piece. It is causal with a receptive field of 5-8 frames, so
+# with this margin a piece matches the full-clip decode; the decoder transformer before it gets the longer context.
+STREAM_VOCODER_MARGIN = 8
 
 logger = logging.getLogger("ray.serve")
 api = FastAPI()
@@ -77,6 +84,8 @@ def settings():
         "voices_dir": os.environ.get("TTS_VOICES_DIR", str(ROOT / "voices")),
         "cuda_graphs": os.environ.get("TTS_CUDA_GRAPHS", "1") != "0",
         "kv_cache_tokens": int(os.environ.get("TTS_KV_CACHE_TOKENS", "3072")),
+        # Frames of reference + speech the decoder transformer sees per streamed piece; qwen-tts decodes 300 at once.
+        "stream_context_frames": int(os.environ.get("TTS_STREAM_CONTEXT_FRAMES", "300")),
     }
 
 
@@ -169,12 +178,79 @@ class ClientGone(Exception):
     """The client disconnected, so generation stopped and the rest of the synthesis would be discarded."""
 
 
+class StreamFinished(Exception):
+    """A streamed synthesis has sent all its audio, so generate_voice_clone's full-clip decode is skipped."""
+
+
 class Job:
-    """One synthesis: its stop event, set on client disconnect, and what the talker hooks report back."""
+    """One synthesis: its stop event, set on client disconnect, and what the talker hooks report back.
+
+    `stream`, when set, is the Streamer that receives each codec frame as the talker completes it.
+    """
 
     def __init__(self):
         self.stop = threading.Event()
         self.token_limited = False
+        self.stream = None
+
+
+def decode_tail(decoder, codes, new, margin):
+    """Waveform of the last `new` frames of `codes` (frames x codebooks), as the speech tokenizer decodes them.
+
+    The same steps as Qwen3TTSTokenizerV2Decoder.forward, except that the vocoder (upsampling and convolutions) runs
+    only on the last `new + margin` frames: it dominates the cost and is causal with a short receptive field, while the
+    decoder transformer before it attends over the whole window. Recheck this when upgrading qwen-tts.
+    """
+    hidden = decoder.quantizer.decode(codes.T[None].clamp(min=0))
+    hidden = decoder.pre_conv(hidden).transpose(1, 2)
+    hidden = decoder.pre_transformer(inputs_embeds=hidden).last_hidden_state.permute(0, 2, 1)
+    hidden = hidden[..., -(new + margin):]
+    for blocks in decoder.upsample:
+        for block in blocks:
+            hidden = block(hidden)
+    for block in decoder.decoder:
+        hidden = block(hidden)
+    return hidden.clamp(min=-1, max=1)[0, 0, -new * int(decoder.total_upsample):]
+
+
+class Streamer:
+    """Decodes a streamed synthesis every STREAM_FRAMES codec frames and hands each piece of PCM to `emit`.
+
+    Each piece is decoded with the voice's reference codes and the speech so far in front, capped at `context` frames,
+    as the full-clip decode puts the reference in front so the vocoder hears the voice first. The clip's loudness is
+    unknown until it ends, so the gain comes from the reference recording, whose level the clone follows; anything
+    past the peak ceiling is clipped.
+    """
+
+    def __init__(self, decoder, ref_code, sample_rate, context, gain_db, emit):
+        self.decoder, self.ref, self.sample_rate, self.context, self.emit = decoder, ref_code, sample_rate, context, emit
+        self.gain = 10 ** (gain_db / 20)
+        self.frames, self.sent, self.samples, self.clipped = [], 0, 0, 0
+        self.first = None  # perf_counter of the first piece
+
+    def frame(self, codes):
+        self.frames.append(codes)
+        if len(self.frames) - self.sent >= STREAM_FRAMES:
+            self.flush()
+
+    def flush(self):
+        import torch
+
+        new = len(self.frames) - self.sent
+        if not new:
+            return
+        window = torch.cat([self.ref.to(self.frames[0].device), torch.stack(self.frames)])[-max(self.context, new):]
+        with torch.inference_mode():
+            audio = decode_tail(self.decoder, window, new, min(STREAM_VOCODER_MARGIN, window.shape[0] - new))
+        audio = audio.float().cpu().numpy() * self.gain
+        if not np.isfinite(audio).all():
+            raise ValueError("Model generated non-finite audio")
+        self.sent += new
+        self.samples += audio.size
+        self.clipped += int(np.count_nonzero(np.abs(audio) > PEAK_CEILING))
+        pcm = np.round(np.clip(audio, -PEAK_CEILING, PEAK_CEILING) * 32767).astype("<i2")
+        self.first = self.first or time.perf_counter()
+        self.emit({"type": "audio", "sample_rate": self.sample_rate, "pcm": base64.b64encode(pcm.tobytes()).decode()})
 
 
 def hook_talker(model, current, prepare=None):
@@ -213,6 +289,19 @@ def hook_talker(model, current, prepare=None):
         def __call__(self, input_ids, scores, **kwargs):
             return torch.full((input_ids.shape[0],), self.stop.is_set(), dtype=torch.bool, device=input_ids.device)
 
+    forward = talker.forward
+
+    @functools.wraps(forward)  # generate validates its kwargs against forward's signature
+    def captured(*args, **kwargs):
+        """Hand each completed codec frame to a streamed job. A decode step's codec_ids are the frame whose first code
+        was sampled in the step before, completed by the code predictor; prefill has none."""
+        outputs = forward(*args, **kwargs)
+        job, codes = current(), outputs.hidden_states[1]
+        if job is not None and job.stream is not None and codes is not None:
+            job.stream.frame(codes[0])
+        return outputs
+
+    talker.forward = captured
     generate = talker.generate
 
     def hooked(*args, logits_processor=None, stopping_criteria=None, **kwargs):
@@ -228,6 +317,9 @@ def hook_talker(model, current, prepare=None):
         if job.stop.is_set():
             raise ClientGone  # skip decoding codes nobody will receive
         job.token_limited = not bool((result.sequences == eos).any())
+        if job.stream is not None:
+            job.stream.flush()
+            raise StreamFinished  # every frame has been decoded and sent
         return result
 
     talker.generate = hooked
@@ -259,6 +351,7 @@ class TTS:
         # One request at a time per replica (max_ongoing_requests=1), so one slot holds the running job
         self.job = None
         self.cuda_graphs = settings["cuda_graphs"]
+        self.stream_context = settings["stream_context_frames"]
         prepare = None
         if self.cuda_graphs:
             from cuda_graphs import install, warm_up
@@ -294,9 +387,21 @@ class TTS:
             transcript = txt.read_text(encoding="utf-8")
             if not transcript.strip():
                 raise ValueError("Reference transcript is empty")
-            cached = stamp, self.tts.create_voice_clone_prompt(ref_audio=str(wav), ref_text=transcript)
+            cached = stamp, self.tts.create_voice_clone_prompt(ref_audio=str(wav), ref_text=transcript), None
             self.prompts[voice] = cached
         return cached[1]
+
+    def reference_loudness(self, voice):
+        """Integrated loudness of a voice's reference WAV, cached with its prompt; streamed requests gain from it."""
+        import soundfile as sf
+
+        self.prompt(voice)
+        stamp, prompt, loudness = self.prompts[voice]
+        if loudness is None:
+            audio, rate = sf.read(self.voices_dir / f"{voice}.wav", dtype="float32", always_2d=True)
+            loudness = integrated_loudness(audio.mean(axis=1), rate)
+            self.prompts[voice] = stamp, prompt, loudness
+        return loudness
 
     @api.get("/")
     def page(self):
@@ -328,6 +433,7 @@ class TTS:
             speed = float(req.get("speed", SPEED_DEFAULT))
             volume = float(req.get("volume", VOLUME_DEFAULT))
             language = req.get("language", "auto")
+            stream = req.get("stream", False)
             sampling = {name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()}
             if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
                 raise ValueError("Enter between 1 and 20000 characters")
@@ -335,6 +441,10 @@ class TTS:
                 raise ValueError("Select a reference voice with an exact transcript")
             if not 0 <= seed < 2**32:
                 raise ValueError("Seed must be between 0 and 4294967295")
+            if not isinstance(stream, bool):
+                raise ValueError("stream must be true or false")
+            if stream and speed != SPEED_DEFAULT:
+                raise ValueError("speed is not supported when streaming")
             if not SPEED_MIN <= speed <= SPEED_MAX:
                 raise ValueError(f"speed must be between {SPEED_MIN} and {SPEED_MAX}")
             if not VOLUME_MIN <= volume <= VOLUME_MAX:
@@ -354,6 +464,8 @@ class TTS:
                 sampling["max_tokens"] = min(max_tokens, budget)
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             return reply(400, {"error": str(exc)})
+        if stream:
+            return self.stream_speech(text, voice, seed, volume, language, sampling)
         job = Job()
         # Shielded so a cancellation reaches the except below while generation keeps running until it sees the event.
         task = asyncio.ensure_future(asyncio.to_thread(self.generate, text, voice, seed, speed, volume, language, sampling, job))
@@ -371,9 +483,72 @@ class TTS:
             logger.exception("Synthesis failed")
             return reply(500, {"error": str(exc)})
 
-    def generate(self, text, voice, seed, speed, volume, language, sampling, job):
-        """Synthesize in a worker thread; returns reply()'s body, media type and headers."""
-        import soundfile as sf
+    def stream_speech(self, text, voice, seed, volume, language, sampling):
+        """Reply with NDJSON while speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
+        loop = asyncio.get_running_loop()
+        events = asyncio.Queue()
+        job = Job()
+
+        def emit(event):
+            loop.call_soon_threadsafe(events.put_nowait, event)
+
+        task = asyncio.ensure_future(asyncio.to_thread(self.generate_stream, text, voice, seed, volume, language,
+                                                       sampling, job, emit))
+
+        async def body():
+            try:
+                while True:
+                    event = await events.get()
+                    yield json.dumps(event) + "\n"
+                    if event["type"] in ("done", "error"):
+                        break
+            finally:
+                if not task.done():
+                    # The client disconnected: stop at the next codec frame so this replica is idle before Serve routes
+                    # it the next queued request.
+                    job.stop.set()
+                    logger.info("POST /api/tts stream abandoned: client disconnected")
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(task)
+
+        return StreamingResponse(body(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
+
+    def generate_stream(self, text, voice, seed, volume, language, sampling, job, emit):
+        """Synthesize a streamed request in a worker thread, emitting its events through a Streamer."""
+        import torch
+
+        try:
+            loudness = self.reference_loudness(voice)
+            gain_db = volume - loudness if np.isfinite(loudness) else 0.0
+            speech_tokenizer = self.tts.model.speech_tokenizer
+            job.stream = streamer = Streamer(speech_tokenizer.model.decoder, self.prompt(voice)[0].ref_code,
+                                             speech_tokenizer.get_output_sample_rate(), self.stream_context, gain_db, emit)
+            try:
+                self.run(text, voice, seed, language, sampling, job)
+                raise ValueError("Generation ended without streaming")  # the talker hook always raises StreamFinished
+            except StreamFinished:
+                pass
+            torch.cuda.synchronize()
+            elapsed = time.perf_counter() - self.started
+            if not streamer.samples:
+                raise ValueError("Model generated no audio")
+            duration = streamer.samples / streamer.sample_rate
+            emit({"type": "done", "synthesis_seconds": round(elapsed, 2),
+                  "first_audio_seconds": round(streamer.first - self.started, 2), "audio_seconds": round(duration, 2),
+                  "rtf": round(elapsed / duration, 3), "token_limited": job.token_limited,
+                  "peak_cuda_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "gain_db": round(gain_db, 1),
+                  "clipped_samples": streamer.clipped})
+        except ClientGone:
+            pass
+        except Exception as exc:
+            logger.exception("Streamed synthesis failed")
+            emit({"type": "error", "error": str(exc)})
+
+    def run(self, text, voice, seed, language, sampling, job):
+        """generate_voice_clone for `job`, seeded, with peak memory reset; `self.started` marks its start.
+
+        Unset options fall back to generation_config.json; greedy decoding leaves temperature at that default unused.
+        """
         import torch
 
         self.job = job
@@ -383,17 +558,23 @@ class TTS:
         torch.cuda.manual_seed_all(seed)
         torch.cuda.reset_peak_memory_stats()
         torch.cuda.synchronize()
-        started = time.perf_counter()
-        # Unset options fall back to generation_config.json; greedy decoding leaves temperature at that default unused.
-        wavs, sample_rate = self.tts.generate_voice_clone(
+        self.started = time.perf_counter()
+        return self.tts.generate_voice_clone(
             text=text, language="Auto" if language == "auto" else language,
             voice_clone_prompt=prompt,
             do_sample=not greedy, temperature=None if greedy else sampling["temperature"],
             top_k=sampling["top_k"], top_p=sampling["top_p"], repetition_penalty=sampling["repetition_penalty"],
             max_new_tokens=sampling["max_tokens"],
         )
+
+    def generate(self, text, voice, seed, speed, volume, language, sampling, job):
+        """Synthesize in a worker thread; returns reply()'s body, media type and headers."""
+        import soundfile as sf
+        import torch
+
+        wavs, sample_rate = self.run(text, voice, seed, language, sampling, job)
         torch.cuda.synchronize()
-        elapsed = time.perf_counter() - started
+        elapsed = time.perf_counter() - self.started
         audio = np.asarray(wavs[0], dtype=np.float32) if wavs else np.zeros(0, dtype=np.float32)
         if not np.isfinite(audio).all():
             raise ValueError("Model generated non-finite audio")

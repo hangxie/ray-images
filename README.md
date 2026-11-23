@@ -1,13 +1,13 @@
 # ray-images
 
-Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)).
+Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)) and a Whisper speech-to-text Ray Serve app (see [STT](#stt)).
 
 The head, LLM workers, and TTS workers all run this one image, so the Ray version and the Serve app code always match across the cluster.
 
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve app (serve_tts.py, index.html), importable as serve_tts:app
+tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py), importable as serve_tts:app and serve_stt:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 ```
 
@@ -86,6 +86,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 - `X-Peak-CUDA-GB` replaces `X-Peak-MLX-GB`, and `/health` reports the CUDA device.
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
+- `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
 
 ### Settings
 
@@ -99,6 +100,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 | `TTS_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for TTS replicas (`py_executable`) |
 | `TTS_CUDA_GRAPHS` | `1` | `0` turns off CUDA-graph decoding (see [Decoding speed](#decoding-speed)) |
 | `TTS_KV_CACHE_TOKENS` | `3072` | Talker KV cache size for CUDA-graph decoding, in codec tokens including the prompt |
+| `TTS_STREAM_CONTEXT_FRAMES` | `300` | Frames of reference plus speech the decoder transformer sees per streamed piece |
 
 Set these in the application's `runtime_env` `env_vars`. They are read where Serve builds the app (the head) and passed to the replicas as `TTS.bind()` arguments.
 
@@ -141,3 +143,31 @@ Two hooks wrap the talker's `generate` (the first codebook) at load time. `Qwen3
 
 - **Greedy end-of-speech**: when end-of-speech is the most likely token, every other token is masked. A missed end-of-speech draw never recovers and runs to the token limit.
 - **Client disconnect**: when Serve cancels a request because its client disconnected, generation stops at the next codec frame and decoding is skipped. The handler waits for this, so the replica is idle before Serve hands it the next queued request.
+
+### Streaming
+
+A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`sample_rate`, base64 16-bit mono `pcm`) about every second of speech as it is generated, then `done` (timings, `first_audio_seconds`, `rtf`, `token_limited`, `peak_cuda_gb`, `gain_db`, `clipped_samples`) or `error`. This is the MLX service's format, which site-up's voice chat plays piece by piece. `speed` is rejected with streaming.
+
+- A third hook wraps the talker's `forward` and hands each completed codec frame (the first code plus the code predictor's 15) to the request's `Streamer`. After the last frame the talker hook raises `StreamFinished`, so `generate_voice_clone`'s full-clip decode is skipped.
+- Every 12 frames, `decode_tail` decodes the new frames with the voice's reference codes and the speech so far in front, up to `TTS_STREAM_CONTEXT_FRAMES`, the way the full-clip decode puts the reference first. Only the decoder transformer sees that whole window. The vocoder after it is causal with a receptive field of 5–8 frames, so it re-runs just 8 frames in front of the new ones. A CPU check with a random-weight decoder matched the full-clip decode to float rounding (about 350 dB SNR) whenever reference plus speech fits in 300 frames. Past that, qwen-tts's own decode drops to 25 frames of left context while streaming keeps 300.
+- The clip's loudness is unknown until it ends, so the gain comes from the reference recording, whose level the clone follows, and samples past the peak ceiling are clipped (`clipped_samples`).
+
+## STT
+
+`serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover it, so the image adds no packages for it.
+
+Mount it at `route_prefix: /v1`: `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/health`.
+
+- The multipart form takes `file`, plus optional `language` (code or English name; detected from the first 30 s when omitted), `response_format` (`json`, `verbose_json`, `text`), and `model` (ignored). Replies carry `text`, `language` as a lowercase English name, and `duration`, plus `X-Transcribe-Seconds`, `X-Audio-Seconds`, `X-RTF`. Errors use OpenAI's `{"error": {"message": ...}}`.
+- Uploads are limited to 25 MB and 300 s. Audio is decoded by libsndfile (WAV, FLAC, OGG, MP3; no FFmpeg, so no M4A or WebM), mixed to mono, and resampled to 16 kHz. Audio past 30 s is decoded long-form with timestamps.
+- The multipart body is parsed with the standard library, so `python-multipart` is not needed.
+- One transcription runs at a time per replica; Serve queues up to `STT_MAX_QUEUED_REQUESTS` (default 8) and answers 503 past that.
+- A replica asks for `num_gpus: 1` only. On 6 GB cards a TTS replica (5.37 GB peak) leaves no room for Whisper, so run one TTS replica and one STT replica on separate cards.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `STT_MODEL` | `openai/whisper-large-v3-turbo` | Model ID reported by `/v1/health`; loaded from the Hub if `STT_MODEL_DIR` is unset |
+| `STT_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
+| `STT_NUM_REPLICAS` | `1` | Replicas, one GPU each |
+| `STT_MAX_QUEUED_REQUESTS` | `8` | Requests Serve queues before answering 503 |
+| `STT_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |

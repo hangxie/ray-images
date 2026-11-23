@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Container image for the homelab Ray cluster, `hangxie/ray-images`: Ray with vLLM, plus a Qwen3-TTS Ray Serve app in its own virtualenv. The head, LLM workers, and TTS workers all run it. See `README.md` for what the image contains and how the TTS app behaves. No CI — the test for a change is building the image and running it on the homelab cluster.
+Container image for the homelab Ray cluster, `hangxie/ray-images`: Ray with vLLM, plus Qwen3-TTS and Whisper STT Ray Serve apps in their own virtualenv. The head, LLM workers, and TTS workers all run it. See `README.md` for what the image contains and how the TTS app behaves. No CI — the test for a change is building the image and running it on the homelab cluster.
 
 ## Layout
 
 - `Dockerfile` — the image: vLLM and FlashInfer steps first, then Brotli, then the TTS virtualenv layer, then the Serve app.
-- `tts/app/` — the Ray Serve app, importable as `serve_tts:app`: `serve_tts.py` (deployment, HTTP API, hooks), `cuda_graphs.py` (CUDA-graph decoding), `index.html`.
+- `tts/app/` — the Ray Serve apps: `serve_tts:app` from `serve_tts.py` (deployment, HTTP API, hooks, streaming), `cuda_graphs.py` (CUDA-graph decoding), `index.html`; `serve_stt:app` from `serve_stt.py` (Whisper, OpenAI transcription API, mounted at `/v1`).
 - `tts/check_requirements.py` — build-time dependency check for the TTS virtualenv.
 - `scripts/prune_flashinfer_cache.py` — build-time removal of FlashInfer cache modules the target GPUs can't run.
 - `Makefile` — `make build` → `hangxie/ray-images:$(VERSION)`.
@@ -20,7 +20,8 @@ Container image for the homelab Ray cluster, `hangxie/ray-images`: Ray with vLLM
 - **Replica settings go through `bind()`.** A deployment's `runtime_env` replaces the application's instead of merging, so replicas don't see the application's `env_vars`. Read `TTS_*` settings on the head (`settings()`) and pass them as `TTS.bind()` arguments; module-level globals must not decide replica behavior. Library variables that must reach the replica process (`HF_*`) go in the deployment's own `runtime_env`.
 - **CUDA graphs.** `cuda_graphs.py` must stay equivalent to qwen-tts's eager path: greedy codes from the graph bodies run eagerly must match HF `generate` on small random models. Sampling options, the end-of-speech hook and the disconnect check stay outside the captured graphs. `TTS_CUDA_GRAPHS=0` falls back to eager decoding for comparison.
 - **Target GPUs.** The image keeps only FlashInfer modules `FLASHINFER_KEEP_ARCHS` (default `8.6`, the RTX 3050s) can run. Add an architecture, or use `all`, before deploying to other GPUs. Peak TTS memory is 5.37 of 6 GB, so check `X-Peak-CUDA-GB` after changes that add GPU memory (`TTS_KV_CACHE_TOKENS` sizes the talker cache).
-- **HTTP surface.** Keep `/`, `/health`, `/voices`, `POST /api/tts` (fields, ranges, error codes, `X-*` headers) compatible with site-up's `index.html` and `txt2mp3.sh`.
+- **HTTP surface.** Keep `/`, `/health`, `/voices`, `POST /api/tts` (fields, ranges, error codes, `X-*` headers, the `stream` NDJSON events) compatible with site-up's `index.html`, `txt2mp3.sh` and voice chat, and `serve_stt` compatible with OpenAI's `/v1/audio/transcriptions` as site-up's `mlx-stt-svc` serves it.
+- **Streaming decode.** `decode_tail` repeats `Qwen3TTSTokenizerV2Decoder.forward` with the vocoder cut to the last frames; recheck it, and that streamed pieces still match the full-clip decode, when upgrading qwen-tts.
 - **Versions and labels.** Candidates under test are image tags `vX.Y.Z-rcN` only, not git tags. A release is a git tag `vX.Y.Z` on the merged commit plus the image tag, rebuilt from cache with `VERSION=vX.Y.Z` so only the version label changes from the tested rc. Upstream versions are `ARG`s recorded as `io.github.hangxie.ray-images.*` labels. The version label is set last in the Dockerfile and also passed with `--label` by the Makefile.
 - **Fix in place.** No parallel versions, shims, or `v2` copies.
 - **Docs.** `README.md` records *why* for non-obvious choices (version pairings, what is omitted to save size). Markdown prose must not use hard line breaks: keep each paragraph and list item on a single source line and let renderers wrap; code blocks and tables are exempt. Markdown files must not contain tabs.
