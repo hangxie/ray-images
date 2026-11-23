@@ -87,6 +87,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
 - `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
+- Neither TTS nor STT authenticates: both serve plain HTTP and ignore `Authorization`. The deployment provides login and API tokens in front of them (in the homelab, OAuth2 Proxy for the page and a bearer check at the Gateway for the APIs).
 
 ### Settings
 
