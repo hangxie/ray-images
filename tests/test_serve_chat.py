@@ -29,6 +29,7 @@ class Backends:
         self.tts_busy = 0  # answer this many TTS requests with 503 first
         self.tts_wav = False  # answer with a whole WAV instead of NDJSON
         self.tts_hold = None  # an Event: after the first piece, wait for the client to hang up and set it
+        self.discovery: list[int] = []  # statuses for the next TTS /health and /voices requests, then 200
         self.requests: list[tuple[str, Any]] = []
         backends = self
 
@@ -47,6 +48,8 @@ class Backends:
 
             def do_GET(self):
                 backends.requests.append(("GET " + self.path, self.headers.get("Authorization")))
+                if backends.discovery:
+                    return self.send(backends.discovery.pop(0), {"error": "busy"})
                 if self.path == "/tts/health":
                     return self.send(200, {"status": "ok", "languages": ["auto", "chinese", "english"]})
                 if self.path == "/tts/voices":
@@ -287,8 +290,8 @@ def test_unknown_route_is_json_404(client):
 
 def test_text_turn(client, backends):
     events = chat(client, text="Hi", history=[{"role": "assistant", "content": "Earlier."}])
-    assert types(events)[:3] == ["text", "text", "text"]
-    assert "".join(e["delta"] for e in events if e["type"] == "text") == "Hello there. How are you today?"
+    # Text and audio interleave as the threads run (the first delta is already a sentence); each keeps its own order.
+    assert [e["delta"] for e in events if e["type"] == "text"] == backends.reply
     audio = [e for e in events if e["type"] == "audio"]
     assert [(e["index"], e["part"]) for e in audio] == [(0, 0), (0, 1), (1, 0), (1, 1)]
     assert [e["text"] for e in audio] == ["Hello there.", None, "How are you today?", None]
@@ -420,3 +423,72 @@ def test_disconnect_cancels_backend_requests(backends, replica):
         assert "done" not in types(events)
 
     asyncio.run(main())
+
+
+def test_busy_tts_voices_is_502(client, backends):
+    backends.discovery = [503]
+    response = client.get("/api/voices")
+    assert response.status_code == 502
+    assert response.json() == {"error": 'TTS unavailable: TTS returned 503: {"error": "busy"}'}
+
+
+def test_tts_languages_are_retried_until_tts_answers(client, backends):
+    backends.discovery = [503]
+    chat(client, text="Bonjour")  # /health busy: the turn falls back to auto
+    backends.reply = ["Bonjour."]
+    chat(client, text="你好")  # asked again, now answered
+    assert [t["language"] for t in backends.sent("tts")] == ["auto", "auto", "chinese"]
+    assert [name for name, _ in backends.requests if name == "GET /tts/health"] == ["GET /tts/health"] * 2
+
+
+def test_oversized_request_is_refused_by_content_length(client, monkeypatch):
+    monkeypatch.setattr(serve_chat, "MAX_REQUEST_BYTES", 100)
+    response = client.post("/api/chat", content=b"x" * 101, headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "Request must be between 1 and 100 bytes"}
+
+
+def test_oversized_chunked_request_is_refused_while_reading(client, monkeypatch):
+    monkeypatch.setattr(serve_chat, "MAX_REQUEST_BYTES", 100)
+
+    def chunks():  # no Content-Length: httpx sends it chunked
+        for _ in range(50):
+            yield b"x" * 10
+
+    response = client.post("/api/chat", content=chunks(), headers={"Content-Type": "application/json"})
+    assert response.status_code == 400
+    assert response.json() == {"error": "Request must be between 1 and 100 bytes"}
+
+
+def body_request(chunks, headers=()):
+    """A Starlette request whose body arrives as `chunks`, recording how many of them were received."""
+    from starlette.requests import Request
+
+    received = []
+
+    async def receive():
+        received.append(1)
+        more = len(received) < len(chunks)
+        return {"type": "http.request", "body": chunks[len(received) - 1], "more_body": more}
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/api/chat",
+        "headers": [(k.encode(), v.encode()) for k, v in headers],
+    }
+    return Request(scope, receive), received
+
+
+def test_read_body_stops_reading_past_the_limit():
+    request, received = body_request([b"x" * 10] * 50)
+    with pytest.raises(ValueError, match="between 1 and 100 bytes"):
+        asyncio.run(serve_chat.read_body(request, 100))
+    assert len(received) == 11  # stopped at the chunk that crossed the limit, not after all 50
+
+
+def test_read_body_refuses_a_declared_oversize_without_reading():
+    request, received = body_request([b"x" * 10], headers=[("content-length", "101")])
+    with pytest.raises(ValueError, match="between 1 and 100 bytes"):
+        asyncio.run(serve_chat.read_body(request, 100))
+    assert received == []

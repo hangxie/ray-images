@@ -187,6 +187,7 @@ function base64Bytes(b64) {
 
 // Barge-in: stop speaking, cancel the server pipeline, and keep what was said so far in the history.
 function interrupt() {
+  if (turn) turn.cancelled = true;  // playback still decoding for it must not start
   if (controller) controller.abort();
   controller = null;
   for (const s of sources) { try { s.stop(); } catch {} }
@@ -211,8 +212,9 @@ function pcmBuffer(event) {
   return audio;
 }
 
-async function play(event) {
+async function play(event, owner) {
   const audio = event.pcm ? pcmBuffer(event) : await ctx.decodeAudioData(base64Bytes(event.wav));
+  if (owner.cancelled) return;  // interrupted while decoding
   const source = ctx.createBufferSource();
   source.buffer = audio;
   source.connect(ctx.destination);
@@ -225,7 +227,7 @@ async function play(event) {
 
 async function send(payload, userText) {
   interrupt();
-  turn = {user: userText, reply: '', bot: null, userBubble: userText ? bubble('user', userText) : null};
+  turn = {user: userText, reply: '', bot: null, userBubble: userText ? bubble('user', userText) : null, cancelled: false};
   const current = turn;
   controller = new AbortController();
   const signal = controller.signal;
@@ -256,7 +258,7 @@ async function send(payload, userText) {
           current.reply += event.delta;
           current.bot.text.textContent = current.reply;
         } else if (event.type === 'audio') {
-          playing = playing.then(() => turn === current && play(event)).catch(err => status(`Playback error: ${err.message}`));
+          playing = playing.then(() => current.cancelled || play(event, current)).catch(err => status(`Playback error: ${err.message}`));
           status(`Speaking · chunk ${event.index + 1}` + (event.rtf ? ` RTF ${event.rtf}` : ''));
         } else if (event.type === 'error') {
           const div = document.createElement('div');
@@ -270,6 +272,7 @@ async function send(payload, userText) {
         }
       }
     }
+    await playing;  // a WAV may still be decoding, with later chunks queued behind it
     if (turn === current) { finishTurn(false); controller = null; idleStatus(); }
   } catch (err) {
     if (err.name !== 'AbortError') { status(`Error: ${err.message}`); if (turn === current) finishTurn(true); }

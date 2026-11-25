@@ -218,13 +218,34 @@ def connect(url, timeout):
 
 
 def tts_get(config, path):
-    """GET a JSON document from the TTS service."""
+    """GET a JSON document from the TTS service; a non-2xx answer (busy, down) raises BackendError."""
     connection, parts = connect(config["tts_url"], 10)
     try:
         connection.request("GET", parts.path + path, headers=auth(config["tokens"]["TTS"]))
-        return json.loads(connection.getresponse().read())
+        response = connection.getresponse()
+        body = response.read()
+        if not 200 <= response.status < 300:
+            raise BackendError("TTS", response.status, body[:200].decode(errors="replace"))
+        return json.loads(body)
     finally:
         connection.close()
+
+
+async def read_body(request, limit):
+    """The request body, refused past `limit` bytes before reading them when Content-Length says so, and while reading
+    them otherwise (chunked uploads), so an oversized upload is never held in memory whole."""
+    too_large = ValueError(f"Request must be between 1 and {limit} bytes")
+    declared = request.headers.get("content-length")
+    if declared is not None and (not declared.isdigit() or int(declared) > limit):
+        raise too_large
+    body = bytearray()
+    async for chunk in request.stream():
+        body += chunk
+        if len(body) > limit:
+            raise too_large
+    if not body:
+        raise too_large
+    return bytes(body)
 
 
 def transcribe(config, turn, audio):
@@ -433,11 +454,14 @@ class Chat:
         self.languages = None  # TTS's languages, read from its /health on first use
 
     def tts_languages(self):
-        """Languages the TTS service accepts, read once from its /health."""
+        """Languages the TTS service accepts, read from its /health once it answers; until then each turn asks again."""
         if self.languages is None:
             try:
-                self.languages = set(tts_get(self.config, "/health").get("languages") or ())
-            except (OSError, ValueError):
+                health = tts_get(self.config, "/health")
+                if not isinstance(health, dict):
+                    raise ValueError("TTS /health is not a JSON object")
+                self.languages = set(health.get("languages") or ())
+            except (OSError, ValueError, BackendError):
                 return set()
         return self.languages
 
@@ -464,7 +488,9 @@ class Chat:
     async def voices(self):
         try:
             voices = await asyncio.to_thread(tts_get, self.config, "/voices")
-        except (OSError, ValueError) as exc:
+            if not isinstance(voices, list) or not all(isinstance(v, str) for v in voices):
+                raise ValueError("TTS /voices is not a list of names")
+        except (OSError, ValueError, BackendError) as exc:
             return reply(502, {"error": f"TTS unavailable: {exc}"})
         default = self.config["voice"]
         return reply(
@@ -475,10 +501,7 @@ class Chat:
     async def chat(self, request: Request):
         started = time.perf_counter()
         try:
-            body = await request.body()
-            if not 0 < len(body) <= MAX_REQUEST_BYTES:
-                raise ValueError(f"Request must be between 1 and {MAX_REQUEST_BYTES} bytes")
-            req = json.loads(body)
+            req = json.loads(await read_body(request, MAX_REQUEST_BYTES))
             audio = base64.b64decode(req["audio"], validate=True) if req.get("audio") else None
             text = req.get("text") if isinstance(req.get("text"), str) else ""
             if not audio and not text.strip():
