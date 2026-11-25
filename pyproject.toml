@@ -1,0 +1,72 @@
+# Development environment for linting and CPU tests (`make setup`). The image itself is built by the Dockerfile with
+# pip; this mirrors the TTS virtualenv (system Ray + torch, qwen-tts's transformers 4.57.3) closely enough to import and
+# exercise the Serve apps and the CUDA-graph bodies on CPU.
+[project]
+name = "ray-images"
+version = "0"
+requires-python = "==3.12.*"
+dependencies = [
+    "qwen-tts==0.1.1",
+    "ray[serve]==2.59.0",
+    "scipy>=1.14.0",
+    "soundfile",
+    # The image's versions: vLLM 0.27.0 pins torch, torchaudio and fastapi in the system environment
+    "fastapi>=0.133.0,<0.137.0",
+    "torch==2.13.0",
+    "torchaudio==2.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx",
+    "mypy",
+    "packaging",
+    "pytest",
+    "ruff",
+    "scipy-stubs",
+]
+
+[tool.uv]
+package = false
+
+# CPU wheels on Linux (CI); macOS wheels from PyPI are CPU-only already
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+src = ["tts/app", "tts", "scripts"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+check_untyped_defs = true
+files = ["tts", "scripts", "tests"]
+mypy_path = ["tts/app", "tts", "scripts", "tests"]
+explicit_package_bases = true
+
+# No type information; flashinfer_jit_cache only exists in the image
+[[tool.mypy.overrides]]
+module = ["flashinfer_jit_cache", "qwen_tts.*", "soundfile"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["tts/app", "tts", "scripts"]
+addopts = ["-ra", "--strict-markers", "-m", "not network"]
+markers = ["network: reads PyPI; run by `make pins`, not `make test`"]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore:Using `httpx` with `starlette.testclient` is deprecated",
+    # Serve's ingress wrapper has an async __del__; tests build replicas without starting Serve
+    "ignore:coroutine 'ingress.<locals>.decorator.<locals>.ASGIIngressWrapper.__del__' was never awaited:RuntimeWarning",
+]

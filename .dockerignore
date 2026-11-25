@@ -1,0 +1,6 @@
+# The Dockerfile copies only scripts/ and tts/; keep the rest, above all the 1.5 GB dev .venv, out of the build context
+*
+!scripts/prune_flashinfer_cache.py
+!tts/check_requirements.py
+!tts/app/
+**/__pycache__
