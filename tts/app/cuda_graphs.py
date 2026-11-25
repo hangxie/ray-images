@@ -14,6 +14,7 @@ On CPU (tests) the same bodies run eagerly without capture. Imported only inside
 
 import time
 from types import SimpleNamespace
+from typing import cast
 
 import torch
 from transformers import StaticCache
@@ -96,9 +97,8 @@ class CodePredictorGraph:
 
     def _decode(self):
         cp = self.cp
-        token = None
+        embeds = self.inputs
         for t in range(self.steps):
-            embeds = self.inputs if t == 0 else cp.model.codec_embedding[t - 1](token[:, None])
             hidden = cp.model(
                 inputs_embeds=cp.small_to_mtp_projection(embeds),
                 attention_mask=self.masks[t],
@@ -108,6 +108,8 @@ class CodePredictorGraph:
             ).last_hidden_state
             token = sample(cp.lm_head[t](hidden[:, -1]), *self.params)
             self.tokens[:, t].copy_(token)
+            if t + 1 < self.steps:
+                embeds = cp.model.codec_embedding[t](token[:, None])  # the next step's input
 
     def generate(
         self,
@@ -156,7 +158,7 @@ class TalkerGraph:
         self.cache_position = torch.zeros(1, dtype=torch.long, device=device)
         self.slots = torch.arange(capacity, device=device)
         self.mask = torch.zeros((1, 1, 1, capacity), dtype=torch.bool, device=device)
-        self.hidden = None
+        self.hidden: torch.Tensor | None = None
         self.graph = Graph(self._decode, device)
         self.original = self.model.forward
 
@@ -194,7 +196,9 @@ class TalkerGraph:
         self.cache_position.copy_(cache_position)
         torch.le(self.slots, self.cache_position, out=self.mask.view(-1))  # attend to filled slots only
         self.graph()
-        hidden = self.hidden.clone()  # the graph overwrites its output on the next replay
+        assert self.hidden is not None  # set by _decode
+        # The graph overwrites its output on the next replay; HF annotates hidden states as FloatTensor
+        hidden = cast(torch.FloatTensor, self.hidden.clone())
         return BaseModelOutputWithPast(
             last_hidden_state=hidden,
             past_key_values=self.cache,

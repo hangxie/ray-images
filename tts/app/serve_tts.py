@@ -17,6 +17,7 @@ import os
 import threading
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import scipy.signal
@@ -237,7 +238,7 @@ class Streamer:
         )
         self.gain = 10 ** (gain_db / 20)
         self.frames, self.sent, self.samples, self.clipped = [], 0, 0, 0
-        self.first = None  # perf_counter of the first piece
+        self.first: float | None = None  # perf_counter of the first piece
 
     def frame(self, codes):
         self.frames.append(codes)
@@ -384,7 +385,7 @@ class TTS:
             )
         # Reference prompts (speech-tokenizer codes + speaker embedding) per voice, encoded once here instead of on
         # every request. Keyed by the pair's mtimes, so a replaced WAV or transcript is re-encoded on next use.
-        self.prompts = {}
+        self.prompts: dict[str, tuple[tuple[int, int], Any, Any]] = {}
         started = time.perf_counter()
         for voice in voices(self.voices_dir):
             try:
@@ -486,7 +487,8 @@ class TTS:
             if language not in self.languages:
                 raise ValueError(f"Language must be one of: {', '.join(self.languages)}")
             for name, (_, _, low, high) in self.sampling.items():
-                if sampling[name] is not None and not low <= sampling[name] <= high:
+                value = sampling[name]
+                if value is not None and not low <= value <= high:
                     raise ValueError(f"{name} must be between {low} and {high}")
             text_tokens = len(self.tts.processor.tokenizer.encode(text))
             max_tokens = sampling["max_tokens"] or self.sampling["max_tokens"][3]
@@ -529,7 +531,7 @@ class TTS:
     def stream_speech(self, text, voice, seed, volume, language, sampling):
         """Reply with NDJSON as speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
         loop = asyncio.get_running_loop()
-        events = asyncio.Queue()
+        events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         job = Job()
 
         def emit(event):
@@ -582,6 +584,7 @@ class TTS:
             elapsed = time.perf_counter() - self.started
             if not streamer.samples:
                 raise ValueError("Model generated no audio")
+            assert streamer.first is not None  # set with the first audio sample
             duration = streamer.samples / streamer.sample_rate
             emit(
                 {
@@ -664,4 +667,5 @@ class TTS:
         )
 
 
-app = TTS.bind(settings())
+# mypy ignores class decorators (python/mypy#3135), so it sees TTS as the plain class rather than a Deployment
+app = cast(serve.Deployment, TTS).bind(settings())

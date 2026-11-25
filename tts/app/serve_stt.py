@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from math import gcd
+from typing import cast
 
 import numpy as np
 import scipy.signal
@@ -171,7 +172,7 @@ class STT:
         """Transcript and language code; the language is detected from the first 30 s when not given."""
         import torch
 
-        extract = self.processor.feature_extractor
+        extract = self.processor.feature_extractor  # type: ignore[attr-defined]  # set by ProcessorMixin
         inputs = extract(
             audio,
             sampling_rate=SAMPLE_RATE,
@@ -198,4 +199,5 @@ class STT:
         return self.processor.batch_decode(tokens, skip_special_tokens=True)[0].strip(), language
 
 
-app = STT.bind(settings())
+# mypy ignores class decorators (python/mypy#3135), so it sees STT as the plain class rather than a Deployment
+app = cast(serve.Deployment, STT).bind(settings())
