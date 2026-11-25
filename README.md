@@ -9,9 +9,13 @@ Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
 tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py), importable as serve_tts:app and serve_stt:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
+tests/                      CPU test suite (pytest)
+pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
 ```
 
 ```bash
+make dev      # development environment in .venv (needs uv)
+make check    # ruff format/lint, mypy, Markdown rules, tests
 make build
 docker inspect -f '{{json .Config.Labels}}' hangxie/ray-images:<tag>
 ```
@@ -19,6 +23,12 @@ docker inspect -f '{{json .Config.Labels}}' hangxie/ray-images:<tag>
 Image tags are this repo's own `vX.Y.Z`, with `vX.Y.Z-rcN` for release candidates. Upstream versions are `ARG`s in the `Dockerfile`, recorded as `io.github.hangxie.ray-images.*` labels.
 
 Images up to `v0.3.0` were published as `hangxie/ray-vllm` and use the `io.github.hangxie.ray-vllm.` label prefix.
+
+## Development
+
+`pyproject.toml` and `uv.lock` define a development environment for linting and tests only; the image is still built with pip from the `Dockerfile`. The environment mirrors the TTS virtualenv (Ray, the torch/torchaudio/fastapi versions vLLM pins, qwen-tts with transformers 4.57.3), so keep its pins in step with the `Dockerfile` when upgrading.
+
+Most of the code needs a GPU, so the tests run what they can on CPU: the HTTP APIs and request validation against fake models, audio post-processing, and, with tiny random qwen-tts models, the generation hooks, CUDA-graph decoding bodies (eager on CPU) against HF `generate`, and streamed decoding against the full-clip decode. Model loading, CUDA graph capture, and real synthesis are still validated on the cluster. CI runs `make check` on every push and pull request.
 
 ## vLLM
 

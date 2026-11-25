@@ -1,0 +1,22 @@
+# Lint and the CPU test suite. The image itself is built and validated on the homelab cluster (AGENTS.md).
+name: check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.4.0
+        with:
+          enable-cache: true
+      - run: make dev
+      - run: make check
+      - run: make pins
