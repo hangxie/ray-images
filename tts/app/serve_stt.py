@@ -1,8 +1,8 @@
 """Ray Serve speech-to-text service: Whisper (transformers / PyTorch on CUDA) behind OpenAI's transcription API.
 
 Port of site-up's ai/mlx-stt-svc with the same HTTP surface under the application's route prefix (/v1). It runs in the
-TTS virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and scipy, so the image
-needs no packages for it. As in serve_tts, module-level imports are limited to what both environments have.
+TTS virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and scipy, so the
+image needs no packages for it. As in serve_tts, module-level imports are limited to what both environments have.
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from math import gcd
+from typing import cast
 
 import numpy as np
 import scipy.signal
@@ -69,7 +70,10 @@ def multipart_fields(content_type, body):
     )
     if not message.is_multipart():
         raise ValueError("Request must be multipart/form-data")
-    return {part.get_param("name", header="content-disposition"): part.get_payload(decode=True) for part in message.iter_parts()}
+    return {
+        part.get_param("name", header="content-disposition"): part.get_payload(decode=True)
+        for part in message.iter_parts()
+    }
 
 
 def load_audio(data):
@@ -151,19 +155,32 @@ class STT:
         except Exception as exc:
             logger.exception("Transcription failed")
             return error(500, str(exc))
-        headers = {"X-Transcribe-Seconds": f"{elapsed:.2f}", "X-Audio-Seconds": f"{duration:.2f}", "X-RTF": f"{elapsed / duration:.3f}"}
+        headers = {
+            "X-Transcribe-Seconds": f"{elapsed:.2f}",
+            "X-Audio-Seconds": f"{duration:.2f}",
+            "X-RTF": f"{elapsed / duration:.3f}",
+        }
         if response_format == "text":
             return reply(200, text.encode(), "text/plain; charset=utf-8", headers)
-        return reply(200, {"text": text, "language": self.languages.get(language, language), "duration": round(duration, 2)},
-                     headers=headers)
+        return reply(
+            200,
+            {"text": text, "language": self.languages.get(language, language), "duration": round(duration, 2)},
+            headers=headers,
+        )
 
     def transcribe(self, audio, language):
         """Transcript and language code; the language is detected from the first 30 s when not given."""
         import torch
 
-        extract = self.processor.feature_extractor
-        inputs = extract(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt", truncation=False, padding="longest",
-                         return_attention_mask=True)
+        extract = self.processor.feature_extractor  # type: ignore[attr-defined]  # set by ProcessorMixin
+        inputs = extract(
+            audio,
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+            truncation=False,
+            padding="longest",
+            return_attention_mask=True,
+        )
         long_form = inputs.input_features.shape[-1] > WINDOW_FRAMES
         if not long_form:  # short audio is padded to the 30 s window the model was trained on
             inputs = extract(audio, sampling_rate=SAMPLE_RATE, return_tensors="pt", return_attention_mask=True)
@@ -173,10 +190,14 @@ class STT:
                 detected = self.model.detect_language(input_features=features[..., :WINDOW_FRAMES])
                 language = self.id_to_language[int(detected[0])]
             tokens = self.model.generate(
-                features, attention_mask=inputs.attention_mask.to("cuda:0"), language=language, task="transcribe",
+                features,
+                attention_mask=inputs.attention_mask.to("cuda:0"),
+                language=language,
+                task="transcribe",
                 return_timestamps=long_form,
             )
         return self.processor.batch_decode(tokens, skip_special_tokens=True)[0].strip(), language
 
 
-app = STT.bind(settings())
+# mypy ignores class decorators (python/mypy#3135), so it sees STT as the plain class rather than a Deployment
+app = cast(serve.Deployment, STT).bind(settings())
