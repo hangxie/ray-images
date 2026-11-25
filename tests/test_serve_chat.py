@@ -26,6 +26,7 @@ class Backends:
         self.stt_status = 200
         self.llm_status = 200
         self.reply = ["Hello there. ", "How are ", "you today?"]
+        self.llm_end = "done"  # after the reply: "done" ([DONE]), "error" (an SSE error event), "eof"
         self.tts_busy = 0  # answer this many TTS requests with 503 first
         self.tts_wav = False  # answer with a whole WAV instead of NDJSON
         self.tts_hold = None  # an Event: after the first piece, wait for the client to hang up and set it
@@ -75,7 +76,10 @@ class Backends:
                         event = {"choices": [{"delta": {"content": delta}}]}
                         self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
                         self.wfile.flush()
-                    self.wfile.write(b"data: [DONE]\n\n")
+                    if backends.llm_end == "error":
+                        self.wfile.write(b'data: {"error": {"message": "context overflow", "code": 500}}\n\n')
+                    elif backends.llm_end == "done":
+                        self.wfile.write(b"data: [DONE]\n\n")
                     return None
                 backends.requests.append(("tts", payload))
                 if backends.tts_busy:
@@ -492,3 +496,15 @@ def test_read_body_refuses_a_declared_oversize_without_reading():
     with pytest.raises(ValueError, match="between 1 and 100 bytes"):
         asyncio.run(serve_chat.read_body(request, 100))
     assert received == []
+
+
+@pytest.mark.parametrize(
+    ("end", "message"),
+    [("error", "LLM returned 200: context overflow"), ("eof", "LLM returned 200: stream ended before [DONE]")],
+)
+def test_llm_stream_failure_after_200_is_an_error(client, backends, end, message):
+    backends.reply, backends.llm_end = ["Hello there. ", "And then"], end
+    events = chat(client, text="Hi")
+    assert {"type": "error", "stage": "llm", "message": message} in events
+    assert events[-1]["type"] == "done" and events[-1]["reply"] == "Hello there. And then"
+    assert [t["text"] for t in backends.sent("tts")] == ["Hello there."]  # the unfinished sentence is not spoken

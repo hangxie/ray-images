@@ -275,7 +275,8 @@ async function send(payload, userText) {
     await playing;  // a WAV may still be decoding, with later chunks queued behind it
     if (turn === current) { finishTurn(false); controller = null; idleStatus(); }
   } catch (err) {
-    if (err.name !== 'AbortError') { status(`Error: ${err.message}`); if (turn === current) finishTurn(true); }
+    current.cancelled = true;  // a decode still pending for this turn must not start speaking
+    if (err.name !== 'AbortError') { status(`Error: ${err.message}`); if (turn === current) interrupt(); }
   }
 }
 

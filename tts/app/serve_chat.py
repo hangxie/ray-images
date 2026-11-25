@@ -293,7 +293,7 @@ def run_llm(config, turn, messages, chunks):
                 if attempt == 2 or turn.cancelled.is_set() or (isinstance(exc, BackendError) and exc.status < 500):
                     raise
                 time.sleep(1)
-        chunker = Chunker()
+        chunker, finished = Chunker(), False
         try:
             while line := response.readline():
                 line = line.strip()
@@ -301,8 +301,13 @@ def run_llm(config, turn, messages, chunks):
                     continue
                 data = line[5:].strip()
                 if data == b"[DONE]":
+                    finished = True
                     break
-                choices = json.loads(data).get("choices") or [{}]
+                event = json.loads(data)
+                if event.get("error"):  # a failure after the 200, as llama.cpp and LiteLLM send it
+                    error = event["error"]
+                    raise BackendError("LLM", 200, error.get("message", error) if isinstance(error, dict) else error)
+                choices = event.get("choices") or [{}]
                 text = (choices[0].get("delta") or {}).get("content")
                 if text:
                     if not reply:
@@ -313,6 +318,8 @@ def run_llm(config, turn, messages, chunks):
                         chunks.put(chunk)
         finally:
             turn.close(connection)
+        if not finished:
+            raise BackendError("LLM", 200, "stream ended before [DONE]")
         for chunk in chunker.feed("", final=True):
             chunks.put(chunk)
     except Exception as exc:
