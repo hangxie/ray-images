@@ -61,8 +61,11 @@ api = FastAPI()
 
 @api.exception_handler(HTTPException)
 async def http_error(request, exc):
-    return JSONResponse({"error": "Not found" if exc.status_code == 404 else str(exc.detail)}, exc.status_code,
-                        headers={"Cache-Control": "no-store"})
+    return JSONResponse(
+        {"error": "Not found" if exc.status_code == 404 else str(exc.detail)},
+        exc.status_code,
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 def reply(status, body, media_type="application/json", headers=None):
@@ -146,11 +149,13 @@ def integrated_loudness(samples, sample_rate):
     k = np.tan(np.pi * f0 / sample_rate)
     a0 = 1.0 + k / q + k * k
     hp_a = [1.0, 2 * (k * k - 1) / a0, (1 - k / q + k * k) / a0]
-    weighted = scipy.signal.lfilter([1.0, -2.0, 1.0], hp_a, scipy.signal.lfilter(shelf_b, shelf_a, samples.astype(np.float64)))
+    weighted = scipy.signal.lfilter(
+        [1.0, -2.0, 1.0], hp_a, scipy.signal.lfilter(shelf_b, shelf_a, samples.astype(np.float64))
+    )
     block, step = round(0.4 * sample_rate), round(0.1 * sample_rate)
     if weighted.size < block:
         return -np.inf
-    power = np.array([np.mean(weighted[s:s + block] ** 2) for s in range(0, weighted.size - block + 1, step)])
+    power = np.array([np.mean(weighted[s : s + block] ** 2) for s in range(0, weighted.size - block + 1, step)])
     loud = -0.691 + 10 * np.log10(np.where(power > 0, power, 1e-12))
     power = power[loud >= -70.0]  # absolute gate
     if power.size:
@@ -204,13 +209,13 @@ def decode_tail(decoder, codes, new, margin):
     hidden = decoder.quantizer.decode(codes.T[None].clamp(min=0))
     hidden = decoder.pre_conv(hidden).transpose(1, 2)
     hidden = decoder.pre_transformer(inputs_embeds=hidden).last_hidden_state.permute(0, 2, 1)
-    hidden = hidden[..., -(new + margin):]
+    hidden = hidden[..., -(new + margin) :]
     for blocks in decoder.upsample:
         for block in blocks:
             hidden = block(hidden)
     for block in decoder.decoder:
         hidden = block(hidden)
-    return hidden.clamp(min=-1, max=1)[0, 0, -new * int(decoder.total_upsample):]
+    return hidden.clamp(min=-1, max=1)[0, 0, -new * int(decoder.total_upsample) :]
 
 
 class Streamer:
@@ -223,7 +228,13 @@ class Streamer:
     """
 
     def __init__(self, decoder, ref_code, sample_rate, context, gain_db, emit):
-        self.decoder, self.ref, self.sample_rate, self.context, self.emit = decoder, ref_code, sample_rate, context, emit
+        self.decoder, self.ref, self.sample_rate, self.context, self.emit = (
+            decoder,
+            ref_code,
+            sample_rate,
+            context,
+            emit,
+        )
         self.gain = 10 ** (gain_db / 20)
         self.frames, self.sent, self.samples, self.clipped = [], 0, 0, 0
         self.first = None  # perf_counter of the first piece
@@ -239,7 +250,7 @@ class Streamer:
         new = len(self.frames) - self.sent
         if not new:
             return
-        window = torch.cat([self.ref.to(self.frames[0].device), torch.stack(self.frames)])[-max(self.context, new):]
+        window = torch.cat([self.ref.to(self.frames[0].device), torch.stack(self.frames)])[-max(self.context, new) :]
         with torch.inference_mode():
             audio = decode_tail(self.decoder, window, new, min(STREAM_VOCODER_MARGIN, window.shape[0] - new))
         audio = audio.float().cpu().numpy() * self.gain
@@ -345,7 +356,11 @@ class TTS:
         self.tts = Qwen3TTSModel.from_pretrained(path, device_map="cuda:0", dtype=torch.bfloat16)
         model = self.tts.model
         speech_tokenizer = model.speech_tokenizer
-        if model.tts_model_type != "base" or speech_tokenizer is None or getattr(speech_tokenizer.model, "encoder", None) is None:
+        if (
+            model.tts_model_type != "base"
+            or speech_tokenizer is None
+            or getattr(speech_tokenizer.model, "encoder", None) is None
+        ):
             raise ValueError("Live cloning requires a Base model with its reference encoder")
         defaults = model.generate_config or {}
         # One request at a time per replica (max_ongoing_requests=1), so one slot holds the running job
@@ -361,8 +376,12 @@ class TTS:
         if self.cuda_graphs:
             self.job = Job()
             seconds = warm_up(self.tts)
-            logger.info("CUDA graphs captured in %.1f s; talker KV cache %d tokens, %.2f GB CUDA allocated", seconds,
-                        settings["kv_cache_tokens"], torch.cuda.memory_allocated() / 1e9)
+            logger.info(
+                "CUDA graphs captured in %.1f s; talker KV cache %d tokens, %.2f GB CUDA allocated",
+                seconds,
+                settings["kv_cache_tokens"],
+                torch.cuda.memory_allocated() / 1e9,
+            )
         # Reference prompts (speech-tokenizer codes + speaker embedding) per voice, encoded once here instead of on
         # every request. Keyed by the pair's mtimes, so a replaced WAV or transcript is re-encoded on next use.
         self.prompts = {}
@@ -370,12 +389,16 @@ class TTS:
         for voice in voices(self.voices_dir):
             try:
                 self.prompt(voice)
-            except Exception as exc:  # e.g. an empty transcript or unreadable WAV: that voice fails per request, as before
+            except (
+                Exception
+            ) as exc:  # e.g. an empty transcript or unreadable WAV: that voice fails per request, as before
                 logger.warning("Voice %s not cached: %s", voice, exc)
         logger.info("Encoded %d voice prompts in %.1f s", len(self.prompts), time.perf_counter() - started)
         self.languages = ["auto", *sorted(set(self.tts.get_supported_languages()) - {"auto"})]
-        self.sampling = {name: (t, d if d is None or name not in defaults else t(defaults[name]), lo, hi)
-                         for name, (t, d, lo, hi) in SAMPLING.items()}
+        self.sampling = {
+            name: (t, d if d is None or name not in defaults else t(defaults[name]), lo, hi)
+            for name, (t, d, lo, hi) in SAMPLING.items()
+        }
         self.device = f"{torch.cuda.get_device_name(model.device)} / CUDA {torch.version.cuda}"
 
     def prompt(self, voice):
@@ -409,13 +432,22 @@ class TTS:
 
     @api.get("/health")
     def health(self):
-        return reply(200, {
-            "status": "ok", "model": self.model_id, "device": self.device, "cuda_graphs": self.cuda_graphs,
-            "languages": self.languages,
-            "sampling": {name: {"default": d, "min": lo, "max": hi, "integer": t is int} for name, (t, d, lo, hi) in self.sampling.items()},
-            "speed": {"default": SPEED_DEFAULT, "min": SPEED_MIN, "max": SPEED_MAX},
-            "volume": {"default": VOLUME_DEFAULT, "min": VOLUME_MIN, "max": VOLUME_MAX},
-        })
+        return reply(
+            200,
+            {
+                "status": "ok",
+                "model": self.model_id,
+                "device": self.device,
+                "cuda_graphs": self.cuda_graphs,
+                "languages": self.languages,
+                "sampling": {
+                    name: {"default": d, "min": lo, "max": hi, "integer": t is int}
+                    for name, (t, d, lo, hi) in self.sampling.items()
+                },
+                "speed": {"default": SPEED_DEFAULT, "min": SPEED_MIN, "max": SPEED_MAX},
+                "volume": {"default": VOLUME_DEFAULT, "min": VOLUME_MIN, "max": VOLUME_MAX},
+            },
+        )
 
     @api.get("/voices")
     def list_voices(self):
@@ -434,7 +466,9 @@ class TTS:
             volume = float(req.get("volume", VOLUME_DEFAULT))
             language = req.get("language", "auto")
             stream = req.get("stream", False)
-            sampling = {name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()}
+            sampling = {
+                name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()
+            }
             if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
                 raise ValueError("Enter between 1 and 20000 characters")
             if voice not in voices(self.voices_dir):
@@ -458,7 +492,14 @@ class TTS:
             max_tokens = sampling["max_tokens"] or self.sampling["max_tokens"][3]
             if text_tokens * SPEECH_TOKENS_PER_TEXT_TOKEN > max_tokens:
                 limit = max_tokens // SPEECH_TOKENS_PER_TEXT_TOKEN
-                return reply(413, {"error": f"Text is {text_tokens} tokens; at most {limit} fit in max_tokens", "tokens": text_tokens, "limit": limit})
+                return reply(
+                    413,
+                    {
+                        "error": f"Text is {text_tokens} tokens; at most {limit} fit in max_tokens",
+                        "tokens": text_tokens,
+                        "limit": limit,
+                    },
+                )
             if sampling["max_tokens"] is None:
                 budget = max(MIN_SPEECH_TOKEN_BUDGET, SPEECH_TOKEN_BUDGET_PER_TEXT_TOKEN * text_tokens)
                 sampling["max_tokens"] = min(max_tokens, budget)
@@ -468,7 +509,9 @@ class TTS:
             return self.stream_speech(text, voice, seed, volume, language, sampling)
         job = Job()
         # Shielded so a cancellation reaches the except below while generation keeps running until it sees the event.
-        task = asyncio.ensure_future(asyncio.to_thread(self.generate, text, voice, seed, speed, volume, language, sampling, job))
+        task = asyncio.ensure_future(
+            asyncio.to_thread(self.generate, text, voice, seed, speed, volume, language, sampling, job)
+        )
         try:
             return reply(200, *await asyncio.shield(task))
         except asyncio.CancelledError:
@@ -484,7 +527,7 @@ class TTS:
             return reply(500, {"error": str(exc)})
 
     def stream_speech(self, text, voice, seed, volume, language, sampling):
-        """Reply with NDJSON while speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
+        """Reply with NDJSON as speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
         loop = asyncio.get_running_loop()
         events = asyncio.Queue()
         job = Job()
@@ -492,8 +535,9 @@ class TTS:
         def emit(event):
             loop.call_soon_threadsafe(events.put_nowait, event)
 
-        task = asyncio.ensure_future(asyncio.to_thread(self.generate_stream, text, voice, seed, volume, language,
-                                                       sampling, job, emit))
+        task = asyncio.ensure_future(
+            asyncio.to_thread(self.generate_stream, text, voice, seed, volume, language, sampling, job, emit)
+        )
 
         async def body():
             try:
@@ -521,8 +565,14 @@ class TTS:
             loudness = self.reference_loudness(voice)
             gain_db = volume - loudness if np.isfinite(loudness) else 0.0
             speech_tokenizer = self.tts.model.speech_tokenizer
-            job.stream = streamer = Streamer(speech_tokenizer.model.decoder, self.prompt(voice)[0].ref_code,
-                                             speech_tokenizer.get_output_sample_rate(), self.stream_context, gain_db, emit)
+            job.stream = streamer = Streamer(
+                speech_tokenizer.model.decoder,
+                self.prompt(voice)[0].ref_code,
+                speech_tokenizer.get_output_sample_rate(),
+                self.stream_context,
+                gain_db,
+                emit,
+            )
             try:
                 self.run(text, voice, seed, language, sampling, job)
                 raise ValueError("Generation ended without streaming")  # the talker hook always raises StreamFinished
@@ -533,11 +583,19 @@ class TTS:
             if not streamer.samples:
                 raise ValueError("Model generated no audio")
             duration = streamer.samples / streamer.sample_rate
-            emit({"type": "done", "synthesis_seconds": round(elapsed, 2),
-                  "first_audio_seconds": round(streamer.first - self.started, 2), "audio_seconds": round(duration, 2),
-                  "rtf": round(elapsed / duration, 3), "token_limited": job.token_limited,
-                  "peak_cuda_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2), "gain_db": round(gain_db, 1),
-                  "clipped_samples": streamer.clipped})
+            emit(
+                {
+                    "type": "done",
+                    "synthesis_seconds": round(elapsed, 2),
+                    "first_audio_seconds": round(streamer.first - self.started, 2),
+                    "audio_seconds": round(duration, 2),
+                    "rtf": round(elapsed / duration, 3),
+                    "token_limited": job.token_limited,
+                    "peak_cuda_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
+                    "gain_db": round(gain_db, 1),
+                    "clipped_samples": streamer.clipped,
+                }
+            )
         except ClientGone:
             pass
         except Exception as exc:
@@ -560,10 +618,14 @@ class TTS:
         torch.cuda.synchronize()
         self.started = time.perf_counter()
         return self.tts.generate_voice_clone(
-            text=text, language="Auto" if language == "auto" else language,
+            text=text,
+            language="Auto" if language == "auto" else language,
             voice_clone_prompt=prompt,
-            do_sample=not greedy, temperature=None if greedy else sampling["temperature"],
-            top_k=sampling["top_k"], top_p=sampling["top_p"], repetition_penalty=sampling["repetition_penalty"],
+            do_sample=not greedy,
+            temperature=None if greedy else sampling["temperature"],
+            top_k=sampling["top_k"],
+            top_p=sampling["top_p"],
+            repetition_penalty=sampling["repetition_penalty"],
             max_new_tokens=sampling["max_tokens"],
         )
 
@@ -587,13 +649,19 @@ class TTS:
         audio, loudness, loudness_limited = normalize_loudness(audio, sample_rate, volume)
         output = io.BytesIO()
         sf.write(output, audio, sample_rate, format="WAV", subtype="PCM_16")
-        return output.getvalue(), "audio/wav", {
-            "X-Synthesis-Seconds": f"{elapsed:.2f}", "X-Audio-Seconds": f"{duration:.2f}",
-            "X-RTF": f"{elapsed / duration:.3f}", "X-Token-Limited": str(job.token_limited).lower(),
-            "X-Peak-CUDA-GB": f"{torch.cuda.max_memory_allocated() / 1e9:.2f}",
-            "X-Loudness-LUFS": f"{loudness:.1f}" if np.isfinite(loudness) else "none",
-            "X-Loudness-Limited": str(loudness_limited).lower(),
-        }
+        return (
+            output.getvalue(),
+            "audio/wav",
+            {
+                "X-Synthesis-Seconds": f"{elapsed:.2f}",
+                "X-Audio-Seconds": f"{duration:.2f}",
+                "X-RTF": f"{elapsed / duration:.3f}",
+                "X-Token-Limited": str(job.token_limited).lower(),
+                "X-Peak-CUDA-GB": f"{torch.cuda.max_memory_allocated() / 1e9:.2f}",
+                "X-Loudness-LUFS": f"{loudness:.1f}" if np.isfinite(loudness) else "none",
+                "X-Loudness-Limited": str(loudness_limited).lower(),
+            },
+        )
 
 
 app = TTS.bind(settings())

@@ -100,21 +100,44 @@ class CodePredictorGraph:
         for t in range(self.steps):
             embeds = self.inputs if t == 0 else cp.model.codec_embedding[t - 1](token[:, None])
             hidden = cp.model(
-                inputs_embeds=cp.small_to_mtp_projection(embeds), attention_mask=self.masks[t], past_key_values=self.cache,
-                cache_position=self.positions[t], use_cache=True,
+                inputs_embeds=cp.small_to_mtp_projection(embeds),
+                attention_mask=self.masks[t],
+                past_key_values=self.cache,
+                cache_position=self.positions[t],
+                use_cache=True,
             ).last_hidden_state
             token = sample(cp.lm_head[t](hidden[:, -1]), *self.params)
             self.tokens[:, t].copy_(token)
 
-    def generate(self, inputs_embeds=None, max_new_tokens=None, do_sample=None, top_k=None, top_p=None,
-                 temperature=None, **kwargs):
+    def generate(
+        self,
+        inputs_embeds=None,
+        max_new_tokens=None,
+        do_sample=None,
+        top_k=None,
+        top_p=None,
+        temperature=None,
+        **kwargs,
+    ):
         try:
             params = (bool(do_sample), int(top_k), float(top_p), float(temperature))
         except (TypeError, ValueError):
             params = None
-        if inputs_embeds is None or inputs_embeds.shape != self.inputs.shape or max_new_tokens != self.steps or params != self.params:
-            return self.original(inputs_embeds=inputs_embeds, max_new_tokens=max_new_tokens, do_sample=do_sample,
-                                 top_k=top_k, top_p=top_p, temperature=temperature, **kwargs)
+        if (
+            inputs_embeds is None
+            or inputs_embeds.shape != self.inputs.shape
+            or max_new_tokens != self.steps
+            or params != self.params
+        ):
+            return self.original(
+                inputs_embeds=inputs_embeds,
+                max_new_tokens=max_new_tokens,
+                do_sample=do_sample,
+                top_k=top_k,
+                top_p=top_p,
+                temperature=temperature,
+                **kwargs,
+            )
         self.inputs.copy_(inputs_embeds)
         self.graph()
         return SimpleNamespace(sequences=self.tokens.clone())
@@ -139,24 +162,44 @@ class TalkerGraph:
 
     def _decode(self):
         self.hidden = self.original(
-            inputs_embeds=self.inputs, attention_mask=self.mask, position_ids=self.position_ids,
-            past_key_values=self.cache, cache_position=self.cache_position, use_cache=True,
+            inputs_embeds=self.inputs,
+            attention_mask=self.mask,
+            position_ids=self.position_ids,
+            past_key_values=self.cache,
+            cache_position=self.cache_position,
+            use_cache=True,
             output_hidden_states=False,
         ).last_hidden_state
 
-    def forward(self, inputs_embeds=None, past_key_values=None, position_ids=None, cache_position=None,
-                output_hidden_states=None, **kwargs):
+    def forward(
+        self,
+        inputs_embeds=None,
+        past_key_values=None,
+        position_ids=None,
+        cache_position=None,
+        output_hidden_states=None,
+        **kwargs,
+    ):
         if past_key_values is not self.cache or inputs_embeds is None or inputs_embeds.shape[1] != 1:
-            return self.original(inputs_embeds=inputs_embeds, past_key_values=past_key_values, position_ids=position_ids,
-                                 cache_position=cache_position, output_hidden_states=output_hidden_states, **kwargs)
+            return self.original(
+                inputs_embeds=inputs_embeds,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
+                cache_position=cache_position,
+                output_hidden_states=output_hidden_states,
+                **kwargs,
+            )
         self.inputs.copy_(inputs_embeds)
         self.position_ids.copy_(position_ids)
         self.cache_position.copy_(cache_position)
         torch.le(self.slots, self.cache_position, out=self.mask.view(-1))  # attend to filled slots only
         self.graph()
         hidden = self.hidden.clone()  # the graph overwrites its output on the next replay
-        return BaseModelOutputWithPast(last_hidden_state=hidden, past_key_values=self.cache,
-                                       hidden_states=(hidden,) if output_hidden_states else None)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden,
+            past_key_values=self.cache,
+            hidden_states=(hidden,) if output_hidden_states else None,
+        )
 
 
 def install(model, capacity, defaults):
@@ -167,8 +210,11 @@ def install(model, capacity, defaults):
     """
     talker = model.talker
     predictor = CodePredictorGraph(
-        talker.code_predictor, defaults.get("subtalker_dosample", True), defaults.get("subtalker_top_k", 50),
-        defaults.get("subtalker_top_p", 1.0), defaults.get("subtalker_temperature", 0.9),
+        talker.code_predictor,
+        defaults.get("subtalker_dosample", True),
+        defaults.get("subtalker_top_k", 50),
+        defaults.get("subtalker_top_p", 1.0),
+        defaults.get("subtalker_temperature", 0.9),
     )
     decoder = TalkerGraph(talker, capacity)
     talker.code_predictor.generate = predictor.generate
@@ -180,8 +226,12 @@ def install(model, capacity, defaults):
         if kwargs["inputs_embeds"].shape[0] != 1 or prompt >= capacity:
             return kwargs  # batch > 1 or a prompt that cannot fit: eager DynamicCache path
         decoder.cache.reset()
-        return {**kwargs, "past_key_values": decoder.cache, "disable_compile": True,
-                "max_new_tokens": min(kwargs["max_new_tokens"], capacity - prompt)}
+        return {
+            **kwargs,
+            "past_key_values": decoder.cache,
+            "disable_compile": True,
+            "max_new_tokens": min(kwargs["max_new_tokens"], capacity - prompt),
+        }
 
     return prepare
 
@@ -193,7 +243,8 @@ def warm_up(tts):
     started = time.perf_counter()
     sample_rate = 24000
     tone = (0.1 * np.sin(2 * np.pi * 220 * np.arange(sample_rate) / sample_rate)).astype(np.float32)
-    tts.generate_voice_clone(text="Warm-up.", language="English", ref_audio=(tone, sample_rate), ref_text="Hello.",
-                             max_new_tokens=8)
+    tts.generate_voice_clone(
+        text="Warm-up.", language="English", ref_audio=(tone, sample_rate), ref_text="Hello.", max_new_tokens=8
+    )
     torch.cuda.synchronize()
     return time.perf_counter() - started

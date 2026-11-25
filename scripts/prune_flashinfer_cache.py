@@ -60,7 +60,7 @@ def main(args):
     if not args or "all" in args:
         print("FlashInfer JIT cache: keeping every module")
         return
-    archs = [int(round(float(a) * 10)) for a in args]
+    archs = [round(float(a) * 10) for a in args]
     root = os.path.join(os.path.dirname(flashinfer_jit_cache.__file__), "jit_cache")
     kept = removed = freed = 0
     for module in sorted(os.listdir(root)):
@@ -72,8 +72,10 @@ def main(args):
         freed += size(path)
         shutil.rmtree(path)
         removed += 1
-    print(f"FlashInfer JIT cache: kept {kept} modules, removed {removed} unusable on sm_{','.join(map(str, archs))} "
-          f"({freed / 1e9:.2f} GB)")
+    print(
+        f"FlashInfer JIT cache: kept {kept} modules, removed {removed} unusable on sm_{','.join(map(str, archs))} "
+        f"({freed / 1e9:.2f} GB)"
+    )
     if kept == 0:
         sys.exit("refusing to leave an empty JIT cache")
 
