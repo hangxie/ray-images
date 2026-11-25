@@ -1,13 +1,13 @@
 # ray-images
 
-Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)) and a Whisper speech-to-text Ray Serve app (see [STT](#stt)).
+Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)), a Whisper speech-to-text Ray Serve app (see [STT](#stt)), and a voice chat app that drives them and an LLM (see [Voice chat](#voice-chat)).
 
 The head, LLM workers, and TTS workers all run this one image, so the Ray version and the Serve app code always match across the cluster.
 
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py), importable as serve_tts:app and serve_stt:app
+tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py; serve_chat.py, chat.html), importable as serve_tts:app, serve_stt:app, serve_chat:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
@@ -182,3 +182,30 @@ Mount it at `route_prefix: /v1`: `POST /v1/audio/transcriptions`, `GET /v1/model
 | `STT_NUM_REPLICAS` | `1` | Replicas, one GPU each |
 | `STT_MAX_QUEUED_REQUESTS` | `8` | Requests Serve queues before answering 503 |
 | `STT_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |
+
+## Voice chat
+
+`serve_chat:app` is site-up's voice chat ([`media/voice-chat`](https://github.com/hangxie/site-up/tree/main/media/voice-chat)) as a Serve app. The page records speech; the replica sends it to STT for a transcript, streams a reply from an OpenAI-compatible LLM, and has TTS speak it one sentence at a time, so the first sentence plays while the rest is still being generated. The turn pipeline, the NDJSON events, and the page are the site-up service's; its README describes how a turn works. A WebSocket transport is tracked in [#14](https://github.com/hangxie/ray-images/issues/14).
+
+Mount it at its own route prefix, for example `route_prefix: /chat`, and open the page with a trailing slash (`/chat/`), since it uses relative URLs: `GET /` (page), `GET /health`, `GET /api/voices`, `POST /api/chat`.
+
+- It holds no models, so a replica asks for one CPU (Serve's default) and no GPU, and runs in the system Python: its imports are the standard library, FastAPI, and Ray.
+- STT, the LLM, and TTS are URLs, so each can be this cluster's Serve apps, the Mac's llama.cpp, or anything else with the same API.
+- A turn is one streamed request that mostly waits on the backends, so a replica takes up to `CHAT_MAX_ONGOING_REQUESTS` turns at once instead of TTS's one.
+- A client that disconnects cancels its turn: the replica shuts its in-flight STT, LLM, and TTS connections, so TTS stops synthesizing at the next frame.
+- There is no client-IP allowlist, unlike on `media`; access control belongs to the deployment in front, as for TTS and STT. The `CHAT_*_TOKEN`s are only what the replica sends to its backends, for example a PAT when TTS sits behind the Gateway's bearer check.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `CHAT_STT_URL` | `http://localhost:5005/v1` | OpenAI-compatible base URL for `/audio/transcriptions` |
+| `CHAT_LLM_URL` | `http://localhost:8080/v1` | OpenAI-compatible base URL for streamed `/chat/completions` |
+| `CHAT_LLM_MODEL` | `qwen3.5-9b-q8-uncensored` | Model ID sent with each LLM request |
+| `CHAT_LLM_MAX_TOKENS` | `512` | Cap on each reply |
+| `CHAT_TTS_URL` | `http://localhost:5004` | Base URL of a TTS with this image's TTS API (`/health`, `/voices`, `/api/tts`) |
+| `CHAT_VOICE` | unset | Voice for turns that name none; the page defaults to it, else to TTS's first voice |
+| `CHAT_SYSTEM_PROMPT` | short, spoken, same-language replies | Replaces the built-in system prompt |
+| `CHAT_STT_TOKEN`, `CHAT_LLM_TOKEN`, `CHAT_TTS_TOKEN` | unset | Sent as `Authorization: Bearer <token>` to that backend |
+| `CHAT_NUM_REPLICAS` | `1` | Replicas |
+| `CHAT_MAX_ONGOING_REQUESTS` | `16` | Turns (and page requests) a replica serves at once |
+
+As for TTS, set these in the application's `runtime_env` `env_vars`; they are read on the head and passed to the replicas through `Chat.bind()`.

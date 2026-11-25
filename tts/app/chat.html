@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice chat</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 0 auto; padding: 1rem; color: #222; }
+  header { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 1; background: white; padding: .5rem 0; border-bottom: 1px solid #e2e8f0; }
+  h1 { font-size: 1.3rem; margin: 0 auto 0 0; }
+  #log { margin: 1rem 0; display: flex; flex-direction: column; gap: .5rem; min-height: 40vh; }
+  .msg { padding: .5rem .75rem; border-radius: .6rem; max-width: 85%; white-space: pre-wrap; }
+  .user { align-self: flex-end; background: #dbeafe; }
+  .assistant { align-self: flex-start; background: #f1f5f9; }
+  .meta { font-size: .75rem; color: #64748b; margin-top: .25rem; }
+  .error { color: #b91c1c; font-size: .85rem; }
+  #talk { width: 100%; padding: 1.2rem; font-size: 1.1rem; border-radius: .8rem; border: none; background: #2563eb; color: white; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #talk.recording { background: #dc2626; }
+  #talk:disabled { background: #94a3b8; }
+  form { display: flex; gap: .5rem; margin-top: .75rem; }
+  form input { flex: 1; padding: .5rem; font-size: 1rem; }
+  #status { font-size: .85rem; color: #475569; margin-top: .5rem; min-height: 1.2em; }
+  #handsfree.on { background: #16a34a; color: white; border-color: #16a34a; }
+  #meter { height: 4px; background: #e2e8f0; border-radius: 2px; margin-top: .4rem; overflow: hidden; visibility: hidden; }
+  #meter.on { visibility: visible; }
+  #level { height: 100%; width: 0; background: #94a3b8; transition: width 50ms linear; }
+  #level.speech { background: #16a34a; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Voice chat</h1>
+  <label>Voice <select id="voice"></select></label>
+  <button id="handsfree" type="button">Hands-free: off</button>
+  <button id="clear" type="button">New conversation</button>
+</header>
+<div id="log"></div>
+<button id="talk" type="button">Start</button>
+<div id="meter"><div id="level"></div></div>
+<form id="typed"><input id="text" placeholder="Or type a message" autocomplete="off"><button>Send</button></form>
+<div id="status"></div>
+<script>
+const $ = id => document.getElementById(id);
+const TARGET_RATE = 16000;
+let ctx, mic, recorder, frames = [], recording = false;
+let history = [], controller = null, sources = [], nextTime = 0, turn = null;
+// Hands-free voice activity detection, all durations in seconds. Speech starts when the level stays
+// above a multiple of the adaptive noise floor for `onset`; while the bot is speaking the bar is
+// higher and longer so leftover echo does not interrupt it. It ends after `hangover` of quiet.
+const VAD = {preroll: 0.3, onset: 0.15, onsetPlaying: 0.35, ratio: 3, ratioPlaying: 6, keepRatio: 2,
+  minLevel: 0.01, hangover: 0.8, minSpeech: 0.3, maxUtterance: 30, floorUp: 3, floorDown: 0.3};
+let handsFree = false, wakeLock = null;
+const vad = {floor: 0.005, above: 0, silence: 0, voiced: 0, length: 0, ring: [], ringLength: 0, auto: false, meterAt: 0, peak: 0};
+
+function status(text) { $('status').textContent = text; }
+function idleStatus() { status(handsFree ? 'Hands-free: listening for speech' : ''); }
+
+function bubble(role, text) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  div.append(document.createTextNode(text));
+  const meta = document.createElement('div');
+  meta.className = 'meta';
+  div.append(meta);
+  $('log').append(div);
+  div.scrollIntoView({block: 'end'});
+  return {div, text: div.firstChild, meta};
+}
+
+async function loadVoices() {
+  try {
+    const res = await fetch('api/voices');
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error);
+    const saved = localStorage.getItem('voice');
+    for (const v of body.voices) $('voice').append(new Option(v, v, false, v === (saved || body.default)));
+  } catch (err) { status(`Voices unavailable: ${err.message}`); }
+}
+$('voice').onchange = () => localStorage.setItem('voice', $('voice').value);
+
+async function start() {
+  ctx = ctx || new AudioContext();
+  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  const worklet = `registerProcessor('rec', class extends AudioWorkletProcessor {
+    process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } });`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
+  mic = ctx.createMediaStreamSource(stream);
+  recorder = new AudioWorkletNode(ctx, 'rec');
+  recorder.port.onmessage = e => { if (recording) frames.push(e.data); if (handsFree) detect(e.data); };
+  mic.connect(recorder);
+  $('talk').textContent = 'Hold to talk (or hold Space)';
+}
+
+function detect(frame) {
+  const dt = frame.length / ctx.sampleRate;
+  let sum = 0;
+  for (const s of frame) sum += s * s;
+  const rms = Math.sqrt(sum / frame.length);
+  const playing = ctx.currentTime < nextTime;
+  const threshold = Math.max(VAD.minLevel, vad.floor * (playing ? VAD.ratioPlaying : VAD.ratio));
+  if (!recording) {
+    // Keep the last `preroll` of audio so the first syllable before the trigger is not lost.
+    vad.ring.push(frame); vad.ringLength += dt;
+    while (vad.ringLength - vad.ring[0].length / ctx.sampleRate > VAD.preroll) vad.ringLength -= vad.ring.shift().length / ctx.sampleRate;
+    if (rms > threshold) vad.above += dt;
+    else {
+      vad.above = 0;
+      // The floor follows quiet quickly and rises slowly, so speech does not drag it up.
+      vad.floor += (rms - vad.floor) * Math.min(1, dt / (rms < vad.floor ? VAD.floorDown : VAD.floorUp));
+      vad.floor = Math.max(vad.floor, 0.001);
+    }
+    if (vad.above >= (playing ? VAD.onsetPlaying : VAD.onset)) {
+      const voiced = vad.above;
+      beginUtterance(vad.ring);
+      Object.assign(vad, {auto: true, silence: 0, voiced, length: voiced});
+    }
+  } else if (vad.auto) {
+    const keep = Math.max(VAD.minLevel * 0.6, vad.floor * VAD.keepRatio);
+    if (rms > keep) { vad.silence = 0; vad.voiced += dt; } else vad.silence += dt;
+    vad.length += dt;
+    if (vad.silence >= VAD.hangover || vad.length >= VAD.maxUtterance) endUtterance(vad.voiced >= VAD.minSpeech, '');
+  }
+  vad.peak = Math.max(vad.peak, rms);
+  if (ctx.currentTime - vad.meterAt > 0.05) {
+    vad.meterAt = ctx.currentTime;
+    // -60 dBFS to -10 dBFS spans the bar.
+    const db = 20 * Math.log10(vad.peak + 1e-9);
+    $('level').style.width = `${Math.max(0, Math.min(100, (db + 60) * 2))}%`;
+    $('level').classList.toggle('speech', recording && vad.auto);
+    vad.peak = 0;
+  }
+}
+
+async function keepAwake() {
+  if (!handsFree || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', keepAwake);
+
+async function toggleHandsFree() {
+  if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); return; } }
+  await ctx.resume();
+  handsFree = !handsFree;
+  $('handsfree').textContent = `Hands-free: ${handsFree ? 'on' : 'off'}`;
+  $('handsfree').classList.toggle('on', handsFree);
+  $('meter').classList.toggle('on', handsFree);
+  Object.assign(vad, {above: 0, ring: [], ringLength: 0});
+  if (handsFree) keepAwake();
+  else {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    if (recording && vad.auto) { recording = false; vad.auto = false; frames = []; $('talk').classList.remove('recording'); }
+  }
+  if (!turn) idleStatus();
+}
+
+function downsample(samples, rate) {
+  if (rate <= TARGET_RATE) return samples;
+  const ratio = rate / TARGET_RATE, out = new Float32Array(Math.floor(samples.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const from = Math.floor(i * ratio), to = Math.min(samples.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = from; j < to; j++) sum += samples[j];
+    out[i] = sum / Math.max(1, to - from);
+  }
+  return out;
+}
+
+function wavBase64(samples, rate) {
+  const buffer = new ArrayBuffer(44 + samples.length * 2), view = new DataView(buffer);
+  const text = (offset, s) => [...s].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+  text(0, 'RIFF'); view.setUint32(4, 36 + samples.length * 2, true); text(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, rate, true); view.setUint32(28, rate * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  text(36, 'data'); view.setUint32(40, samples.length * 2, true);
+  samples.forEach((s, i) => view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, s)) * 0x7fff, true));
+  let binary = '';
+  const bytes = new Uint8Array(buffer);
+  for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(binary);
+}
+
+function base64Bytes(b64) {
+  const binary = atob(b64), bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Barge-in: stop speaking, cancel the server pipeline, and keep what was said so far in the history.
+function interrupt() {
+  if (controller) controller.abort();
+  controller = null;
+  for (const s of sources) { try { s.stop(); } catch {} }
+  sources = []; nextTime = 0;
+  finishTurn(true);
+}
+
+function finishTurn(interrupted) {
+  if (!turn) return;
+  if (turn.user) history.push({role: 'user', content: turn.user});
+  if (turn.reply) history.push({role: 'assistant', content: turn.reply + (interrupted ? ' …' : '')});
+  if (interrupted && turn.bot) turn.bot.meta.textContent += ' (interrupted)';
+  turn = null;
+}
+
+// A streamed piece is raw 16-bit PCM, built into a buffer at its own rate: decoding each piece as a separate WAV
+// would resample it alone and could click at the joins. A whole-chunk WAV from a non-streaming backend is decoded.
+function pcmBuffer(event) {
+  const samples = new Int16Array(base64Bytes(event.pcm));
+  const audio = ctx.createBuffer(1, samples.length, event.sample_rate), channel = audio.getChannelData(0);
+  for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
+  return audio;
+}
+
+async function play(event) {
+  const audio = event.pcm ? pcmBuffer(event) : await ctx.decodeAudioData(base64Bytes(event.wav));
+  const source = ctx.createBufferSource();
+  source.buffer = audio;
+  source.connect(ctx.destination);
+  nextTime = Math.max(nextTime, ctx.currentTime + 0.05);
+  source.start(nextTime);
+  nextTime += audio.duration;
+  sources.push(source);
+  source.onended = () => { sources = sources.filter(s => s !== source); };
+}
+
+async function send(payload, userText) {
+  interrupt();
+  turn = {user: userText, reply: '', bot: null, userBubble: userText ? bubble('user', userText) : null};
+  const current = turn;
+  controller = new AbortController();
+  const signal = controller.signal;
+  status('Thinking…');
+  // Playback is decoded and scheduled in order even though decoding is asynchronous.
+  let playing = Promise.resolve();
+  try {
+    const res = await fetch('api/chat', {method: 'POST', signal, headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({...payload, history, voice: $('voice').value})});
+    if (!res.ok) throw new Error((await res.json()).error);
+    const reader = res.body.getReader(), decoder = new TextDecoder();
+    let pending = '';
+    while (true) {
+      const {value, done} = await reader.read();
+      if (done) break;
+      pending += decoder.decode(value, {stream: true});
+      const lines = pending.split('\n');
+      pending = lines.pop();
+      for (const line of lines) {
+        if (!line.trim() || turn !== current) continue;
+        const event = JSON.parse(line);
+        if (event.type === 'transcript') {
+          current.user = event.text;
+          current.userBubble = bubble('user', event.text || '(nothing heard)');
+          current.userBubble.meta.textContent = `STT ${event.seconds}s · ${event.language || '?'}`;
+        } else if (event.type === 'text') {
+          if (!current.bot) current.bot = bubble('assistant', '');
+          current.reply += event.delta;
+          current.bot.text.textContent = current.reply;
+        } else if (event.type === 'audio') {
+          playing = playing.then(() => turn === current && play(event)).catch(err => status(`Playback error: ${err.message}`));
+          status(`Speaking · chunk ${event.index + 1}` + (event.rtf ? ` RTF ${event.rtf}` : ''));
+        } else if (event.type === 'error') {
+          const div = document.createElement('div');
+          div.className = 'error';
+          div.textContent = `${event.stage} error: ${event.message}`;
+          $('log').append(div);
+        } else if (event.type === 'done') {
+          const t = event.timings;
+          if (current.bot) current.bot.meta.textContent = `first token ${t.llm_first_token ?? '-'}s · first audio ${t.first_audio ?? '-'}s · LLM done ${t.llm_done ?? '-'}s`;
+          current.reply = event.reply || current.reply;
+        }
+      }
+    }
+    if (turn === current) { finishTurn(false); controller = null; idleStatus(); }
+  } catch (err) {
+    if (err.name !== 'AbortError') { status(`Error: ${err.message}`); if (turn === current) finishTurn(true); }
+  }
+}
+
+async function pressTalk() {
+  if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); } return; }
+  if (recording) return;
+  await ctx.resume();
+  beginUtterance([]);
+}
+
+function beginUtterance(preroll) {
+  interrupt();
+  frames = preroll.slice(); recording = true;
+  Object.assign(vad, {auto: false, ring: [], ringLength: 0, above: 0});
+  $('talk').classList.add('recording');
+  status('Listening…');
+}
+
+// Hands-free utterances end on silence, not on release.
+function releaseTalk() {
+  if (!recording || vad.auto) return;
+  endUtterance(true, 'Too short; hold while speaking.');
+}
+
+function endUtterance(keep, shortMessage) {
+  recording = false; vad.auto = false;
+  $('talk').classList.remove('recording');
+  const length = frames.reduce((n, f) => n + f.length, 0);
+  if (!keep || length < ctx.sampleRate * 0.3) { frames = []; if (shortMessage) status(shortMessage); else idleStatus(); return; }
+  const samples = new Float32Array(length);
+  let offset = 0;
+  for (const f of frames) { samples.set(f, offset); offset += f.length; }
+  frames = [];
+  const rate = Math.min(ctx.sampleRate, TARGET_RATE);
+  send({audio: wavBase64(downsample(samples, ctx.sampleRate), rate)}, '');
+}
+
+$('talk').addEventListener('pointerdown', e => { e.preventDefault(); pressTalk(); });
+$('talk').addEventListener('pointerup', releaseTalk);
+$('talk').addEventListener('pointercancel', releaseTalk);
+$('talk').addEventListener('pointerleave', releaseTalk);
+document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && document.activeElement !== $('text')) { e.preventDefault(); pressTalk(); } });
+document.addEventListener('keyup', e => { if (e.code === 'Space' && document.activeElement !== $('text')) releaseTalk(); });
+$('typed').onsubmit = async e => {
+  e.preventDefault();
+  const text = $('text').value.trim();
+  if (!text) return;
+  $('text').value = '';
+  if (!ctx) ctx = new AudioContext();
+  await ctx.resume();
+  send({text}, text);
+};
+$('handsfree').onclick = toggleHandsFree;
+$('clear').onclick = () => { interrupt(); history = []; $('log').replaceChildren(); idleStatus(); };
+loadVoices();
+</script>
+</body>
+</html>

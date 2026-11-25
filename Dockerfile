@@ -78,12 +78,13 @@ RUN python3 -m venv --system-site-packages /home/ray/tts-venv \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
-# The Serve app, importable as serve_tts:app: the head builds it with the system Python, replicas run it in the venv.
+# The Serve apps, importable as serve_tts:app, serve_stt:app and serve_chat:app: the head builds them with the system
+# Python; TTS and STT replicas run in the venv, chat replicas in the system Python.
 # pyarrow (from the base image, unused here) is blocked for the checks because its native library segfaults under
 # amd64 emulation on Apple Silicon; ray.serve and qwen_tts import fine without it.
 COPY --chown=ray:users tts/app/ /home/ray/tts/
 ENV PYTHONPATH=/home/ray/tts${PYTHONPATH:+:${PYTHONPATH}}
-RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, transformers; print('Serve app:', serve_tts.app, 'system transformers', transformers.__version__)" \
+RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, serve_stt, serve_chat, transformers; print('Serve apps:', serve_tts.app, serve_stt.app, serve_chat.app, 'system transformers', transformers.__version__)" \
     && /home/ray/tts-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts; assert transformers.__version__ == '4.57.3', transformers.__version__; print('TTS venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
 
 # Last, so a new version only changes image metadata and keeps the build cache
