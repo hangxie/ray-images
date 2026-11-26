@@ -3,12 +3,11 @@
 Port of site-up's ai/mlx-stt-svc with the same HTTP surface under the application's route prefix (/v1), plus a
 recording page at `GET /` (stt.html) and a WebSocket at `/audio/stream` that transcribes a live recording as it goes.
 It runs in the TTS virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and
-scipy, so the image needs no packages for it. As in serve_tts, module-level imports are limited to what both
-environments have.
+scipy; the stream adds only silero-vad. As in serve_tts, module-level imports are limited to what both environments
+have.
 """
 
 import asyncio
-import collections
 import email.parser
 import email.policy
 import html
@@ -104,74 +103,87 @@ def load_audio(data):
 class Segmenter:
     """Cuts a live 16 kHz stream into pieces for Whisper at short pauses, so text keeps up with long speech.
 
-    Past `min_seconds` the next `pause_seconds` of quiet ends a piece; at `max_seconds` it ends after the quietest
-    20 ms frame past `min_seconds`. Speech and quiet are judged against the noise floor, the lowest 20 ms level of the
-    last `floor_seconds` (speech always has gaps between syllables), so they don't depend on the microphone's gain;
-    only levels under -54 dBFS never count as speech. A piece is trimmed to its speech plus `margin_seconds`, and one
-    with less than `min_speech_seconds` of speech is dropped (Whisper makes up text from silence). A piece starts a
-    paragraph after `paragraph_seconds` without speech. Times are seconds from the start of the stream.
+    `probability` scores each 32 ms frame as speech, 0 to 1: Silero VAD in the replica (STT.detector), which tells
+    speech from music and noise where loudness can't. A frame is speech from SPEECH and quiet below QUIET (Silero's
+    own hysteresis); speech runs shorter than `min_run_seconds` don't count, as in Silero's own segmenting, since a
+    beat or a clatter can score as speech for a frame or two. Past `min_seconds` the next `pause_seconds` of quiet
+    ends a piece; at `max_seconds` it ends after the frame least like speech past `min_seconds`. A piece is trimmed
+    to its speech plus `margin_seconds`, and one with less than `min_speech_seconds` of speech is dropped (Whisper
+    makes up text from silence and music). A piece starts a paragraph after `paragraph_seconds` without speech. Times
+    are seconds from the start of the stream.
     """
 
-    FRAME = SAMPLE_RATE // 50
-    MIN_SPEECH_LEVEL = 0.002  # -54 dBFS
-    MIN_FLOOR = 0.0005
+    FRAME = 512  # the frame Silero VAD takes at 16 kHz
+    SPEECH, QUIET = 0.5, 0.35
 
     def __init__(
         self,
+        probability,
         min_seconds=5.0,
         max_seconds=15.0,
         pause_seconds=0.25,
         paragraph_seconds=2.0,
         min_speech_seconds=0.3,
         margin_seconds=0.3,
-        floor_seconds=5.0,
+        min_run_seconds=0.25,
     ):
         def frames(seconds):
-            return max(1, int(np.ceil(seconds * 50 - 1e-6)))
+            return max(1, int(np.ceil(seconds * SAMPLE_RATE / self.FRAME - 1e-6)))
 
+        self.probability = probability
         self.min_frames, self.max_frames = frames(min_seconds), frames(max_seconds)
         self.pause_frames, self.margin_frames = frames(pause_seconds), frames(margin_seconds)
         self.min_speech_frames, self.paragraph_seconds = frames(min_speech_seconds), paragraph_seconds
+        self.min_run_frames = frames(min_run_seconds)
         self.audio = np.zeros(0, dtype=np.float32)  # the current piece, starting on a frame boundary
-        self.levels: list[float] = []  # RMS of each whole frame of the current piece
-        self.recent: collections.deque[float] = collections.deque(maxlen=frames(floor_seconds))
+        self.scores: list[float] = []  # speech probability of each whole frame of the current piece
         self.start = 0  # stream sample where the current piece starts
-        self.floor = self.MIN_FLOOR
         self.last_speech: float | None = None  # stream time where the previous piece's speech ended
-        self.peak = 0.0  # the loudest frame so far, for the stream's log line
         self.cuts = 0  # pieces ended so far, with or without speech
+        self.frames = self.speech_frames = 0  # for the stream's log line
+        self.peak = 0.0
 
-    def speech(self, level):
-        return level > max(self.MIN_SPEECH_LEVEL, self.floor * 3)
+    def speech(self, score):
+        return score >= self.SPEECH
 
-    def quiet(self, level):
-        return level < max(self.MIN_SPEECH_LEVEL * 0.75, self.floor * 2)
+    def voiced(self, scores):
+        """Indexes of the frames in runs of speech at least `min_run_seconds` long."""
+        found, run = [], []
+        for i, score in enumerate([*scores, 0.0]):
+            if self.speech(score):
+                run.append(i)
+                continue
+            if len(run) >= self.min_run_frames:
+                found += run
+            run = []
+        return found
 
     def feed(self, samples):
         """Pieces completed by `samples`: dicts with start, end, audio, and paragraph."""
         self.audio = np.concatenate([self.audio, np.asarray(samples, dtype=np.float32)])
         pieces = []
-        while len(self.audio) >= (len(self.levels) + 1) * self.FRAME:
-            i = len(self.levels)
-            level = float(np.sqrt(np.mean(np.square(self.audio[i * self.FRAME : (i + 1) * self.FRAME]))))
-            self.levels.append(level)
-            self.recent.append(level)
-            self.floor, self.peak = max(min(self.recent), self.MIN_FLOOR), max(self.peak, level)
-            n = len(self.levels)
-            if n >= self.min_frames and all(self.quiet(v) for v in self.levels[-self.pause_frames :]):
+        while len(self.audio) >= (len(self.scores) + 1) * self.FRAME:
+            i = len(self.scores)
+            frame = self.audio[i * self.FRAME : (i + 1) * self.FRAME]
+            score = float(self.probability(frame))
+            self.scores.append(score)
+            self.frames, self.speech_frames = self.frames + 1, self.speech_frames + self.speech(score)
+            self.peak = max(self.peak, float(np.sqrt(np.mean(np.square(frame)))))
+            n = len(self.scores)
+            if n >= self.min_frames and all(v < self.QUIET for v in self.scores[-self.pause_frames :]):
                 pieces += self.cut(n)
             elif n >= self.max_frames:
-                pieces += self.cut(self.min_frames + int(np.argmin(self.levels[self.min_frames :])) + 1)
+                pieces += self.cut(self.min_frames + int(np.argmin(self.scores[self.min_frames :])) + 1)
         return pieces
 
     def flush(self):
         """The rest of the stream as a last piece, if it has speech."""
-        return self.cut(len(self.levels), whole=True)
+        return self.cut(len(self.scores), whole=True)
 
     def current(self):
         """The piece so far, trimmed at the front as cut() will, for a preview of its text; None without speech.
         `cuts` tells whether the piece has ended since."""
-        voiced = [i for i, level in enumerate(self.levels) if self.speech(level)]
+        voiced = self.voiced(self.scores)
         if len(voiced) < self.min_speech_frames:
             return None
         first = max(0, voiced[0] - self.margin_frames) * self.FRAME
@@ -179,10 +191,10 @@ class Segmenter:
 
     def cut(self, frames, whole=False):
         end = len(self.audio) if whole else frames * self.FRAME
-        audio, levels, start = self.audio[:end], self.levels[:frames], self.start
-        self.audio, self.levels, self.start = self.audio[end:], self.levels[frames:], start + end
+        audio, scores, start = self.audio[:end], self.scores[:frames], self.start
+        self.audio, self.scores, self.start = self.audio[end:], self.scores[frames:], start + end
         self.cuts += 1
-        voiced = [i for i, level in enumerate(levels) if self.speech(level)]
+        voiced = self.voiced(scores)
         if len(voiced) < self.min_speech_frames:
             return []
         first = max(0, voiced[0] - self.margin_frames) * self.FRAME
@@ -311,7 +323,7 @@ class STT:
             await websocket.send_json({"type": "error", "message": str(exc)})
             await websocket.close(1008)
             return
-        segmenter, pieces = Segmenter(), asyncio.Queue[dict | None]()
+        segmenter, pieces = Segmenter(self.detector()), asyncio.Queue[dict | None]()
         state = {"language": language, "context": ""}
         counts = {"pieces": 0, "segments": 0, "partials": 0}
 
@@ -380,14 +392,28 @@ class STT:
             if partial is not None:
                 partial.cancel()
             logger.info(
-                "Stream ended: %.1f s of audio, %d pieces, %d with text, %d previews, peak %.1f dBFS, floor %.1f dBFS",
+                "Stream ended: %.1f s of audio, %.0f%% speech, %d pieces, %d with text, %d previews, peak %.1f dBFS",
                 (segmenter.start + len(segmenter.audio)) / SAMPLE_RATE,
+                100 * segmenter.speech_frames / max(1, segmenter.frames),
                 counts["pieces"],
                 counts["segments"],
                 counts["partials"],
                 20 * np.log10(segmenter.peak + 1e-9),
-                20 * np.log10(segmenter.floor),
             )
+
+    def detector(self):
+        """A speech probability for each 32 ms frame: a Silero VAD model of the stream's own, since it keeps state
+        between frames. Loading one takes ~20 ms and a frame ~0.3 ms on one CPU thread; no GPU."""
+        import torch
+        from silero_vad import load_silero_vad
+
+        model = load_silero_vad()
+
+        def probability(frame):
+            with torch.no_grad():
+                return model(torch.from_numpy(np.ascontiguousarray(frame)), SAMPLE_RATE).item()
+
+        return probability
 
     def language(self, value):
         """Whisper's language code for a code or English name, or None (detect) when empty."""

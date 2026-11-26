@@ -15,7 +15,17 @@ import serve_stt
 import serve_tts
 
 APP = Path(__file__).resolve().parent.parent / "tts" / "app"
-REPLICA_ONLY = ["torch", "torchaudio", "transformers", "qwen_tts", "soundfile", "accelerate", "librosa", "gradio"]
+REPLICA_ONLY = [
+    "torch",
+    "torchaudio",
+    "transformers",
+    "qwen_tts",
+    "soundfile",
+    "accelerate",
+    "librosa",
+    "gradio",
+    "silero_vad",
+]
 # The head's environment as far as the apps can tell: a finder that refuses the replica-only packages. (Entries of None
 # in sys.modules would not do: scipy looks torch up there and expects a module.)
 HEAD = """

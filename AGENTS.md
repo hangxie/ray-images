@@ -16,7 +16,7 @@ Container image for the homelab Ray cluster, `hangxie/ray-images`: Ray with vLLM
 ## Rules
 
 - **One image.** Don't split vLLM and TTS into separate images: the head's copy of `serve_tts` decides the deployment options and the workers' copy runs synthesis, so both must come from one build.
-- **Two Python environments.** The system Python carries vLLM (transformers 5.x). `/home/ray/tts-venv` (`--system-site-packages`) carries qwen-tts and transformers 4.57.3 and reuses the system Ray, torch, torchaudio, and CUDA libraries; install into it with torch/torchaudio constrained to the system versions so it never gets its own copy. TTS replicas use it through `runtime_env` `py_executable`.
+- **Two Python environments.** The system Python carries vLLM (transformers 5.x). `/home/ray/tts-venv` (`--system-site-packages`) carries qwen-tts, transformers 4.57.3 and silero-vad (STT's stream) and reuses the system Ray, torch, torchaudio, and CUDA libraries; install into it with torch/torchaudio constrained to the system versions so it never gets its own copy. TTS replicas use it through `runtime_env` `py_executable`.
 - **Dependency checks.** `pip check` must pass for the system environment. In the venv, `pip check` always reports vLLM's transformers requirement, so `tts/check_requirements.py` must pass there instead. Don't install with `--no-deps` or drop declared dependencies to save space.
 - **Layer order.** Keep the TTS layers after the vLLM layers so a TTS change doesn't rebuild vLLM.
 - **Serve app imports.** The head imports `serve_tts.py`, `serve_stt.py`, and `serve_chat.py` with the system Python to build the apps. Module-level imports stay limited to what both environments have (stdlib, numpy, scipy, fastapi, ray); import `torch`, `transformers`, `qwen_tts`, `soundfile` inside the replica. Nothing module-level that can't be pickled (e.g. `threading.local`) — Serve pickles the FastAPI app.
@@ -56,7 +56,7 @@ podman push localhost/hangxie/ray-images:<tag> docker.io/hangxie/ray-images:<tag
 
 ## Testing
 
-`make test` runs on CPU in the uv environment, which mirrors the TTS venv: Ray 2.59.0, torch/torchaudio/fastapi at vLLM 0.27.0's pins, qwen-tts 0.1.1 with transformers 4.57.3 (CPU torch wheels on Linux). Keep those pins in step with the Dockerfile; `tests/test_pins.py` fails when they drift. Its vLLM check reads PyPI, so it runs in `make pins` (and CI), not `make test`.
+`make test` runs on CPU in the uv environment, which mirrors the TTS venv: Ray 2.59.0, torch/torchaudio/fastapi at vLLM 0.27.0's pins, qwen-tts 0.1.1 with transformers 4.57.3, silero-vad 6.3 (CPU torch wheels on Linux). Keep those pins in step with the Dockerfile; `tests/test_pins.py` fails when they drift. Its vLLM check reads PyPI, so it runs in `make pins` (and CI), not `make test`.
 
 - `tests/conftest.py` builds tiny random qwen-tts models (talker + code predictor, and a speech-tokenizer decoder at the real upsampling rates), so tests run the code that reaches into qwen-tts internals against the installed version. Their weights are re-initialized larger than the default init, which decodes silence and attends almost uniformly, hiding mistakes.
 - Generation runs under `torch.no_grad()`, as `generate_voice_clone` does; inference mode would make the static caches inference tensors.

@@ -5,6 +5,7 @@ The routes, multipart parsing, audio loading, segmenting and validation are the 
 
 import asyncio
 import json
+from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -24,6 +25,7 @@ def replica(monkeypatch):
     replica.languages, replica.language_codes = LANGUAGES, TO_LANGUAGE_CODE
     replica.calls = []
     replica.gpu = asyncio.Lock()
+    replica.detector = lambda: loud  # exact cuts; Silero itself is tested on real speech below
 
     def transcribe(audio, language, prompt=""):
         replica.calls.append((audio, language))
@@ -197,20 +199,26 @@ def test_page_language_picker_knows_whispers_languages(client):
     assert all(p in codes for p in presets[:-1])  # each preset is a name the server accepts
 
 
+FRAME = serve_stt.Segmenter.FRAME / 16000  # seconds
+
+
 def speech(seconds, amplitude=0.1):
-    """A tone in 0.2 s syllables with 0.06 s dips to a tenth between them, as speech has."""
-    audio = tone(seconds=seconds, rate=16000, amplitude=amplitude)
-    audio[(np.arange(audio.size) % round(0.26 * 16000)) >= round(0.2 * 16000)] *= 0.1
-    return audio
+    """A tone: speech to the `loud` detector, which the cutting-rule tests use."""
+    return tone(seconds=seconds, rate=16000, amplitude=amplitude)
 
 
 def silence(seconds):
     return np.zeros(round(seconds * 16000), dtype=np.float32)
 
 
+def loud(frame):
+    """A stand-in for Silero VAD with exact answers: a frame louder than -40 dBFS is speech."""
+    return 0.9 if np.sqrt(np.mean(np.square(frame))) > 0.01 else 0.0
+
+
 def segment(audio, segmenter=None, step=1600):
     """Pieces of `audio` fed in 0.1 s chunks, as the page sends them, then flushed."""
-    segmenter = segmenter or serve_stt.Segmenter()
+    segmenter = segmenter or serve_stt.Segmenter(loud)
     pieces = [p for i in range(0, len(audio), step) for p in segmenter.feed(audio[i : i + step])]
     return pieces + segmenter.flush()
 
@@ -221,29 +229,33 @@ def spans(pieces):
 
 def test_short_speech_is_one_piece_trimmed_to_speech():
     pieces = segment(np.concatenate([silence(1.0), speech(2.0), silence(1.0)]))
-    assert spans(pieces) == [(0.7, 3.3, True)]
-    assert pieces[0]["audio"].size == round(2.6 * 16000)
+    # Speech in frames 31 (0.992 s, which holds its first 8 ms) to 93; 10 frames (0.32 s) of margin each side.
+    assert spans(pieces) == [(round(21 * FRAME, 2), round(104 * FRAME, 2), True)]
+    assert pieces[0]["audio"].size == 83 * 512
 
 
 def test_pause_after_min_seconds_ends_a_piece():
-    # The 0.2 s pause at 3 s is too early; the one at 6 s ends the piece once 0.25 s of it has gone by.
+    # The 0.2 s pause at 3 s is too early; the one at 6 s ends the piece once 8 quiet frames (0.256 s) have gone by.
     audio = np.concatenate([speech(3.0), silence(0.2), speech(2.8), silence(0.5), speech(2.0)])
-    assert spans(segment(audio)) == [(0.0, 6.26, True), (6.26, 8.5, False)]
+    pieces = spans(segment(audio))
+    assert len(pieces) == 2 and pieces[0][:1] == (0.0,) and pieces[1][2] is False
+    assert 6.0 < pieces[0][1] < 6.3 and pieces[0][1] == pieces[1][0]
 
 
-def test_long_speech_is_cut_at_the_quietest_frame_by_max_seconds():
+def test_long_speech_is_cut_at_the_frame_least_like_speech_by_max_seconds():
     audio = speech(20.0, amplitude=0.2)
-    audio[round(9.0 * 16000) : round(9.02 * 16000)] *= 0.05  # deeper than the gaps between syllables, but no pause
-    assert spans(segment(audio)) == [(0.0, 9.02, True), (9.02, 20.0, False)]
+    dip = round(9.0 / FRAME)  # one frame that isn't speech, too short for a pause
+    audio[dip * 512 : (dip + 1) * 512] = 0
+    assert spans(segment(audio)) == [
+        (0.0, round((dip + 1) * FRAME, 2), True),
+        (round((dip + 1) * FRAME, 2), 20.0, False),
+    ]
 
 
 def test_silence_is_dropped_and_a_long_gap_starts_a_paragraph():
     audio = np.concatenate([speech(1.0), silence(12.0), speech(1.0), silence(1.0), speech(1.0)])
-    assert spans(segment(audio, serve_stt.Segmenter(min_seconds=1.0))) == [
-        (0.0, 1.26, True),
-        (12.7, 14.26, True),
-        (14.7, 16.0, False),
-    ]
+    pieces = spans(segment(audio, serve_stt.Segmenter(loud, min_seconds=1.0)))
+    assert [(round(start), paragraph) for start, _, paragraph in pieces] == [(0, True), (13, True), (15, False)]
 
 
 def test_no_speech_gives_no_pieces():
@@ -251,25 +263,57 @@ def test_no_speech_gives_no_pieces():
     assert segment(np.concatenate([silence(5.0), speech(0.1), silence(5.0)])) == []
 
 
-def test_quiet_microphone():
-    # Speech at about -50 dBFS, which a fixed -40 dBFS threshold missed entirely.
-    audio = np.concatenate([silence(1.0), speech(3.0, amplitude=0.005), silence(1.0)])
-    assert spans(segment(audio)) == [(0.7, 4.3, True)]
+def test_short_runs_of_speech_do_not_count():
+    # 0.2 s blips (a beat, a clatter) from 3 s to 6 s, between sentences at 0 s and 7 s: they make no piece, and the
+    # sentences are still apart enough for two paragraphs.
+    blips = np.concatenate([np.concatenate([speech(0.2), silence(0.4)]) for _ in range(5)])
+    audio = np.concatenate([speech(2.0), silence(1.0), blips, silence(1.0), speech(2.0)])
+    pieces = spans(segment(audio, serve_stt.Segmenter(loud, min_seconds=1.0)))
+    assert [p[2] for p in pieces] == [True, True]
+    assert pieces[0][1] < 2.4 and pieces[1][0] > 6.6
 
 
-def test_steady_loud_noise_is_not_speech():
-    noise = (np.random.default_rng(1).standard_normal(20 * 16000) * 0.03).astype(np.float32)
-    assert segment(noise.copy()) == []
-    noise[10 * 16000 : 13 * 16000] += speech(3.0, amplitude=0.3)
-    assert spans(segment(noise)) == [(10.0, 13.3, True)]  # the noise before it was cut off as a piece at 10 s
+CLIP = Path(__file__).with_name("data") / "speech.flac"  # two sentences 0.5 s apart, from macOS `say`
 
 
-def test_noise_floor_lets_pauses_through_background_noise():
-    # Noise above the fixed quiet level: the adaptive floor still finds the pause at 8 s instead of cutting at 15 s.
-    audio = (np.random.default_rng(0).standard_normal(16 * 16000) * 0.008).astype(np.float32)
-    audio[2 * 16000 : 8 * 16000] += speech(6.0)
-    audio[10 * 16000 : 12 * 16000] += speech(2.0)
-    assert spans(segment(audio)) == [(1.7, 8.26, True), (9.7, 12.3, True)]
+def music(seconds, level_db, rng):
+    """Background music with a beat: chords that swell on every beat over a quiet pad, and a hi-hat between beats.
+    Loudness alone took this for continuous speech."""
+    t = np.arange(round(seconds * 16000)) / 16000
+    chords = [(220.0, 277.2, 329.6), (196.0, 246.9, 293.7), (174.6, 220.0, 261.6), (196.0, 246.9, 293.7)]
+    bar = (t // 2).astype(int) % len(chords)
+    beat = 0.05 + 0.95 * np.exp(-((t % 0.5) * 12))
+    out = sum(np.sin(2 * np.pi * np.array([c[k] for c in chords])[bar] * t) for k in range(3)) * beat
+    out = out + rng.standard_normal(t.size) * np.exp(-(((t + 0.25) % 0.5) * 40)) * 0.5
+    return (out * 10 ** (level_db / 20) / np.sqrt(np.mean(out**2))).astype(np.float32)
+
+
+@pytest.fixture(scope="module")
+def silero():
+    return cast(Any, serve_stt.STT).func_or_class.detector
+
+
+def test_silero_finds_paragraphs_under_music(silero):
+    import soundfile as sf
+
+    clip, _ = sf.read(CLIP, dtype="float32")
+    voice = np.concatenate([clip, silence(3.0), clip, silence(3.0), clip])
+    starts = [0.0, clip.size / 16000 + 3, 2 * (clip.size / 16000 + 3)]
+    rng = np.random.default_rng(0)
+    for level in (None, -45, -35, -25, -20):
+        audio = voice if level is None else voice + music(voice.size / 16000, level, rng)
+        pieces = segment(audio, serve_stt.Segmenter(silero(None)))
+        paragraphs = [p["start"] for p in pieces if p["paragraph"]]
+        assert len(paragraphs) == 3 and all(abs(p - s) < 0.5 for p, s in zip(paragraphs, starts, strict=True)), (
+            level,
+            spans(pieces),
+        )
+
+
+def test_silero_drops_music_noise_and_silence(silero):
+    rng = np.random.default_rng(1)
+    for audio in (music(30.0, -20, rng), (rng.standard_normal(30 * 16000) * 0.03).astype(np.float32), silence(30.0)):
+        assert segment(audio, serve_stt.Segmenter(silero(None))) == []
 
 
 def pcm(audio):
@@ -301,8 +345,8 @@ def test_stream_transcribes_pieces_with_context(client, replica):
     assert [e.pop("seconds") >= 0 for e in events[:-1]] == [True] * 3
     assert events == [
         {"type": "segment", "start": 0.0, "end": 5.76, "text": "Piece 1.", "language": "french", "paragraph": True},
-        {"type": "segment", "start": 8.2, "end": 10.76, "text": "Piece 2.", "language": "french", "paragraph": True},
-        {"type": "segment", "start": 10.76, "end": 12.0, "text": "Piece 3.", "language": "french", "paragraph": False},
+        {"type": "segment", "start": 8.16, "end": 10.78, "text": "Piece 2.", "language": "french", "paragraph": True},
+        {"type": "segment", "start": 10.78, "end": 12.0, "text": "Piece 3.", "language": "french", "paragraph": False},
         {"type": "done"},
     ]
     # Each piece gets the text so far as its prompt, and the language found in the first.
@@ -321,7 +365,7 @@ def test_stream_previews_the_piece_being_spoken(client, replica, monkeypatch):
     events = stream(client, np.concatenate([speech(8.0), silence(1.0), speech(3.0)]))
     partials = [e for e in events if e["type"] == "partial"]
     segments = [e for e in events if e["type"] == "segment"]
-    assert [s["start"] for s in segments] == [0.0, 8.7]
+    assert [s["start"] for s in segments] == [0.0, 8.67]
     assert len(partials) >= 3
     for p in partials:  # each previews a piece that later ends, and comes before it
         segment_at = next(i for i, e in enumerate(events) if e["type"] == "segment" and e["start"] == p["start"])
