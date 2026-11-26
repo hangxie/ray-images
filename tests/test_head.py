@@ -120,7 +120,7 @@ def test_stt_deployment_options():
     deployment = cast(Any, serve_stt.STT)
     assert deployment.ray_actor_options["num_gpus"] == 1
     assert "py_executable" in deployment.ray_actor_options["runtime_env"]
-    assert deployment.max_ongoing_requests == 1
+    assert deployment.max_ongoing_requests == 16  # each open stream is one ongoing request; a lock serialises the GPU
 
 
 def test_chat_deployment_options():

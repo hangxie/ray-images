@@ -19,7 +19,7 @@
   #talk.recording { background: #dc2626; }
   .actions { display: flex; gap: .5rem; margin-top: .75rem; }
   #status { font-size: .85rem; color: #475569; margin-top: .5rem; min-height: 1.2em; }
-  #handsfree.on { background: #16a34a; color: white; border-color: #16a34a; }
+  #handsfree.on, #meeting.on { background: #16a34a; color: white; border-color: #16a34a; }
   #meter { height: 4px; background: #e2e8f0; border-radius: 2px; margin-top: .4rem; overflow: hidden; visibility: hidden; }
   #meter.on { visibility: visible; }
   #level { height: 100%; width: 0; background: #94a3b8; transition: width 50ms linear; }
@@ -32,6 +32,7 @@
   <label>Language <input id="language" placeholder="auto" list="languages" autocomplete="off"></label>
   <datalist id="languages"><option value="english"><option value="chinese"><option value="japanese"><option value="korean"><option value="french"><option value="german"><option value="spanish"></datalist>
   <button id="handsfree" type="button">Hands-free: off</button>
+  <button id="meeting" type="button">Meeting: off</button>
 </header>
 <div id="log"></div>
 <button id="talk" type="button">Start</button>
@@ -39,6 +40,7 @@
 <div class="actions">
   <button id="copy" type="button">Copy</button>
   <button id="download" type="button">Download</button>
+  <button id="subtitles" type="button">Subtitles (.vtt)</button>
   <button id="clear" type="button">Clear</button>
 </div>
 <div id="status"></div>
@@ -56,12 +58,19 @@ let handsFree = false, wakeLock = null;
 const vad = {floor: 0.005, above: 0, silence: 0, voiced: 0, length: 0, ring: [], ringLength: 0, auto: false, meterAt: 0, peak: 0};
 // Utterances are transcribed one at a time, in order, while recording goes on.
 let queue = Promise.resolve(), pending = 0;
-// The transcript survives a reload: [{at, text, meta}].
+// Meeting mode streams the microphone to audio/stream, which cuts it at pauses and sends back timestamped pieces of
+// text; pieces join into paragraphs. null when off.
+let meeting = null;
+// The transcript survives a reload: [{at, text, meta, segments: [{start, end, text}]}], times in ms since the epoch.
 let transcript = JSON.parse(localStorage.getItem('transcript') || '[]');
 
 function status(text) { $('status').textContent = text; }
 function idleStatus() {
-  if (pending) status(`Transcribing ${pending} utterance${pending > 1 ? 's' : ''}…`);
+  if (meeting) {
+    const seconds = Math.floor((Date.now() - (meeting.at ?? Date.now())) / 1000);
+    const time = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+    status(meeting.stopping ? 'Meeting: transcribing the rest…' : `Meeting: recording ${time}`);
+  } else if (pending) status(`Transcribing ${pending} utterance${pending > 1 ? 's' : ''}…`);
   else status(handsFree ? 'Hands-free: listening for speech' : '');
 }
 function save() { localStorage.setItem('transcript', JSON.stringify(transcript)); }
@@ -91,7 +100,13 @@ async function start() {
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
   mic = ctx.createMediaStreamSource(stream);
   recorder = new AudioWorkletNode(ctx, 'rec');
-  recorder.port.onmessage = e => { if (recording) record(e.data); if (handsFree) detect(e.data); };
+  recorder.port.onmessage = e => {
+    const rms = level(e.data);
+    if (meeting) stream(e.data);
+    if (recording) record(e.data);
+    if (handsFree) detect(e.data, rms);
+    if (handsFree || meeting) showLevel(rms, meeting ? rms > VAD.minLevel : recording && vad.auto);
+  };
   mic.connect(recorder);
   $('talk').textContent = 'Hold to talk (or hold Space)';
 }
@@ -104,11 +119,14 @@ function record(frame) {
   }
 }
 
-function detect(frame) {
-  const dt = frame.length / ctx.sampleRate;
+function level(frame) {
   let sum = 0;
   for (const s of frame) sum += s * s;
-  const rms = Math.sqrt(sum / frame.length);
+  return Math.sqrt(sum / frame.length);
+}
+
+function detect(frame, rms) {
+  const dt = frame.length / ctx.sampleRate;
   const threshold = Math.max(VAD.minLevel, vad.floor * VAD.ratio);
   if (!recording) {
     // Keep the last `preroll` of audio so the first syllable before the trigger is not lost.
@@ -137,24 +155,29 @@ function detect(frame) {
       Object.assign(vad, {auto: true, silence: 0, voiced: 0, length: 0});
     }
   }
+}
+
+function showLevel(rms, speech) {
   vad.peak = Math.max(vad.peak, rms);
   if (ctx.currentTime - vad.meterAt > 0.05) {
     vad.meterAt = ctx.currentTime;
     // -60 dBFS to -10 dBFS spans the bar.
     const db = 20 * Math.log10(vad.peak + 1e-9);
     $('level').style.width = `${Math.max(0, Math.min(100, (db + 60) * 2))}%`;
-    $('level').classList.toggle('speech', recording && vad.auto);
+    $('level').classList.toggle('speech', speech);
     vad.peak = 0;
+    if (meeting) idleStatus();
   }
 }
 
 async function keepAwake() {
-  if (!handsFree || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  if (!(handsFree || meeting) || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
   try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
 }
 document.addEventListener('visibilitychange', keepAwake);
 
 async function toggleHandsFree() {
+  if (meeting) return;
   if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); return; } }
   await ctx.resume();
   handsFree = !handsFree;
@@ -195,6 +218,7 @@ function wavBlob(samples, rate) {
 }
 
 async function pressTalk() {
+  if (meeting) return;
   if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); } return; }
   if (recording) return;
   await ctx.resume();
@@ -250,7 +274,7 @@ async function transcribe(wav, at, language, shown) {
     shown.div.className = 'entry';
     shown.text.textContent = body.text;
     shown.meta.textContent = meta;
-    transcript.push({at, text: body.text, meta});
+    transcript.push({at, text: body.text, meta, segments: [{start: at, end: at + body.duration * 1000, text: body.text}]});
     save();
   } catch (err) {
     shown.div.className = 'error';
@@ -258,22 +282,125 @@ async function transcribe(wav, at, language, shown) {
   }
 }
 
+function meetingUi() {
+  $('meeting').textContent = meeting ? (meeting.stopping ? 'Meeting: finishing…' : 'Meeting: on') : 'Meeting: off';
+  $('meeting').classList.toggle('on', !!meeting);
+  $('meeting').disabled = !!meeting?.stopping;
+  $('talk').disabled = $('handsfree').disabled = !!meeting;
+  $('meter').classList.toggle('on', handsFree || !!meeting);
+  idleStatus();
+}
+
+async function startMeeting() {
+  if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); return; } }
+  await ctx.resume();
+  if (handsFree) await toggleHandsFree();
+  if (recording) endUtterance(true, '');
+  const url = new URL('audio/stream', location.href), language = $('language').value.trim();
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (language) url.searchParams.set('language', language);
+  const socket = new WebSocket(url);
+  // at: when the stream's first sample was recorded; its pieces' times count from there.
+  const m = meeting = {socket, at: null, frames: [], length: 0, item: null, shown: null, stopping: false};
+  socket.onmessage = e => onMeetingEvent(m, JSON.parse(e.data));
+  socket.onclose = e => {
+    if (meeting !== m) return;
+    if (!m.stopping) entry(`Meeting connection closed${e.reason ? `: ${e.reason}` : ''}; recording stopped.`, clock(Date.now()), 'error');
+    endMeeting();
+  };
+  keepAwake();
+  meetingUi();
+}
+
+// Frames are sent about every 0.1 s as 16 kHz 16-bit PCM; they wait here until the socket opens.
+function stream(frame) {
+  if (meeting.stopping) return;
+  meeting.at ??= Date.now() - frame.length / ctx.sampleRate * 1000;
+  meeting.frames.push(frame); meeting.length += frame.length;
+  if (meeting.length >= ctx.sampleRate * 0.1) sendFrames();
+}
+
+function sendFrames() {
+  if (meeting.socket.readyState !== WebSocket.OPEN || !meeting.length) return;
+  const samples = new Float32Array(meeting.length);
+  let offset = 0;
+  for (const f of meeting.frames) { samples.set(f, offset); offset += f.length; }
+  meeting.frames = []; meeting.length = 0;
+  const down = downsample(samples, ctx.sampleRate), pcm = new Int16Array(down.length);
+  down.forEach((s, i) => { pcm[i] = Math.max(-1, Math.min(1, s)) * 0x7fff; });
+  meeting.socket.send(pcm.buffer);
+}
+
+function stopMeeting() {
+  if (!meeting || meeting.stopping) return;
+  if (meeting.socket.readyState !== WebSocket.OPEN) { meeting.socket.close(); endMeeting(); return; }
+  sendFrames();
+  meeting.stopping = true;
+  meeting.socket.send(JSON.stringify({type: 'stop'}));
+  meetingUi();
+}
+
+function endMeeting() {
+  const m = meeting;
+  meeting = null;
+  if (m.socket.readyState === WebSocket.OPEN) m.socket.close();
+  if (wakeLock && !handsFree) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  meetingUi();
+}
+
+function onMeetingEvent(m, event) {
+  if (event.type === 'done') { if (meeting === m) endMeeting(); return; }
+  if (event.type === 'error') { entry(`Transcription failed: ${event.message}`, clock(Date.now()), 'error'); return; }
+  if (event.type !== 'segment') return;
+  const start = m.at + event.start * 1000, end = m.at + event.end * 1000;
+  if (event.paragraph || !m.item) {
+    m.item = {at: start, text: '', meta: '', segments: []};
+    transcript.push(m.item);
+    m.shown = entry('', '');
+  }
+  m.item.text += (m.item.text ? ' ' : '') + event.text;
+  m.item.segments.push({start, end, text: event.text});
+  m.item.meta = `${clock(m.item.at)}–${clock(end)} · ${event.language || '?'} · meeting · ${event.seconds}s for the last piece`;
+  m.shown.text.textContent = m.item.text;
+  m.shown.meta.textContent = m.item.meta;
+  m.shown.div.scrollIntoView({block: 'end'});
+  save();
+}
+
+// Entries saved before segments were kept have no end time.
+function segments(e) { return e.segments || [{start: e.at, end: e.at, text: e.text}]; }
+
 function transcriptText() { return transcript.map(e => e.text).join('\n') + (transcript.length ? '\n' : ''); }
+function timestampedText() { return transcript.map(e => `[${clock(e.at)}] ${e.text}\n`).join(''); }
+
+function vtt() {
+  const origin = transcript.length ? segments(transcript[0])[0].start : 0;
+  const time = ms => {
+    const t = Math.max(0, Math.round(ms - origin)), pad = (n, w = 2) => String(n).padStart(w, '0');
+    return `${pad(Math.floor(t / 3600000))}:${pad(Math.floor(t / 60000) % 60)}:${pad(Math.floor(t / 1000) % 60)}.${pad(t % 1000, 3)}`;
+  };
+  const cues = transcript.flatMap(segments).map(s => `${time(s.start)} --> ${time(Math.max(s.end, s.start + 1000))}\n${s.text}`);
+  return ['WEBVTT', ...cues].join('\n\n') + '\n';
+}
+
+function saveAs(text, type, extension) {
+  const link = document.createElement('a'), stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+  link.href = URL.createObjectURL(new Blob([text], {type}));
+  link.download = `transcript-${stamp}.${extension}`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
 
 $('copy').onclick = async () => {
   try { await navigator.clipboard.writeText(transcriptText()); status('Copied'); }
   catch (err) { status(`Copy failed: ${err.message}`); }
 };
-$('download').onclick = () => {
-  const link = document.createElement('a'), stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
-  link.href = URL.createObjectURL(new Blob([transcriptText()], {type: 'text/plain'}));
-  link.download = `transcript-${stamp}.txt`;
-  link.click();
-  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
-};
+$('download').onclick = () => saveAs(timestampedText(), 'text/plain', 'txt');
+$('subtitles').onclick = () => saveAs(vtt(), 'text/vtt', 'vtt');
 $('clear').onclick = () => {
   if (transcript.length && !confirm('Clear the transcript?')) return;
   transcript = []; save();
+  if (meeting) meeting.item = null;  // the next piece starts a new paragraph
   $('log').replaceChildren();
   idleStatus();
 };
@@ -285,6 +412,7 @@ $('talk').addEventListener('pointerleave', releaseTalk);
 document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && document.activeElement !== $('language')) { e.preventDefault(); pressTalk(); } });
 document.addEventListener('keyup', e => { if (e.code === 'Space' && document.activeElement !== $('language')) releaseTalk(); });
 $('handsfree').onclick = toggleHandsFree;
+$('meeting').onclick = () => (meeting ? stopMeeting() : startMeeting());
 for (const e of transcript) entry(e.text, e.meta);
 </script>
 </body>

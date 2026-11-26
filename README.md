@@ -98,7 +98,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
 - `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
-- Neither TTS nor STT authenticates: both serve plain HTTP and ignore `Authorization`. The deployment provides login and API tokens in front of them (in the homelab, OAuth2 Proxy for the page and a bearer check at the Gateway for the APIs).
+- Neither TTS nor STT authenticates: both serve plain HTTP (and STT's WebSocket) and ignore `Authorization`. The deployment provides login and API tokens in front of them (in the homelab, OAuth2 Proxy for the page and a bearer check at the Gateway for the APIs).
 
 ### Settings
 
@@ -168,14 +168,20 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 `serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover it, so the image adds no packages for it.
 
-Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/health`.
+Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`.
 
-- The page records speech and appends each utterance's transcript to a running transcript, which it keeps in the browser's local storage and can copy or download as text. Hold the button (or Space) to talk, or turn on hands-free, which starts and stops on speech with the voice chat page's voice activity detection and keeps listening until turned off; a hands-free utterance is cut every 30 s so long speech is transcribed as it goes. Utterances are sent one at a time, in order, while recording continues. The header shows the image version, as on the other pages. It uses relative URLs, so open it with the trailing slash (`/v1/`).
+- The page records speech and appends each utterance's transcript to a running transcript, which it keeps in the browser's local storage and can copy, download as text with a clock time per paragraph, or download as WebVTT subtitles with one cue per piece. Hold the button (or Space) to talk, or turn on hands-free, which starts and stops on speech with the voice chat page's voice activity detection and keeps listening until turned off; a hands-free utterance is cut every 30 s so long speech is transcribed as it goes. Utterances are sent one at a time, in order, while recording continues. The header shows the image version, as on the other pages. It uses relative URLs, so open it with the trailing slash (`/v1/`).
+- Meeting mode, for one long recording such as a meeting, streams the microphone to `audio/stream` instead of uploading utterances, and text appears while people keep talking. Pieces join into a paragraph until a pause of 2 s or more. The connection is one Serve request for the whole meeting, so nothing queues in the browser; if it drops, recording stops and the transcript so far is kept. A proxy in front must pass WebSocket upgrades.
+
+`audio/stream` takes 16 kHz mono 16-bit little-endian PCM as binary messages, then `{"type": "stop"}`, with an optional `language` query parameter. It answers with a `segment` event (`start`, `end` in seconds from the first sample, `text`, `language`, `paragraph`, `seconds` spent transcribing) for each piece with text, `error` for a piece that failed (the stream goes on), and `done` after the last piece.
+
+- The stream is cut into pieces on the server, at short pauses, as tried on the page in v0.7.0-rc2: past 5 s the next 0.25 s pause ends a piece, and at 15 s the piece ends after its quietest 20 ms frame past 5 s. Pauses are found against an adaptive noise floor, as in the page's voice activity detection. A piece is trimmed to its speech plus 0.3 s, and one with less than 0.3 s of speech is dropped, since Whisper makes up text from silence.
+- Each piece gets the stream's text so far as Whisper's prompt (its last 160 tokens), so words cut at a piece boundary and names spelled earlier come out right. The language found in the first piece is kept for the rest of the stream rather than detected again on every short piece.
 
 - The multipart form takes `file`, plus optional `language` (code or English name; detected from the first 30 s when omitted), `response_format` (`json`, `verbose_json`, `text`), and `model` (ignored). Replies carry `text`, `language` as a lowercase English name, and `duration`, plus `X-Transcribe-Seconds`, `X-Audio-Seconds`, `X-RTF`. Errors use OpenAI's `{"error": {"message": ...}}`.
 - Uploads are limited to 25 MB and 300 s. Audio is decoded by libsndfile (WAV, FLAC, OGG, MP3; no FFmpeg, so no M4A or WebM), mixed to mono, and resampled to 16 kHz. Audio past 30 s is decoded long-form with timestamps.
 - The multipart body is parsed with the standard library, so `python-multipart` is not needed.
-- One transcription runs at a time per replica; Serve queues up to `STT_MAX_QUEUED_REQUESTS` (default 8) and answers 503 past that.
+- One transcription runs at a time per replica, behind a lock in the replica, since a stream holds its Serve request for as long as it lasts. A replica takes `STT_MAX_ONGOING_REQUESTS` (default 16) requests and streams at once, Serve queues up to `STT_MAX_QUEUED_REQUESTS` (default 8) more, and answers 503 past that.
 - A replica asks for `num_gpus: 1` only. On 6 GB cards a TTS replica (5.37 GB peak) leaves no room for Whisper, so run one TTS replica and one STT replica on separate cards.
 
 | Setting | Default | Effect |
@@ -183,6 +189,7 @@ Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptio
 | `STT_MODEL` | `openai/whisper-large-v3-turbo` | Model ID reported by `/v1/health`; loaded from the Hub if `STT_MODEL_DIR` is unset |
 | `STT_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
 | `STT_NUM_REPLICAS` | `1` | Replicas, one GPU each |
+| `STT_MAX_ONGOING_REQUESTS` | `16` | Requests and streams a replica takes at once; transcription itself runs one at a time |
 | `STT_MAX_QUEUED_REQUESTS` | `8` | Requests Serve queues before answering 503 |
 | `STT_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |
 
