@@ -258,11 +258,13 @@ def test_page_uses_relative_urls(client):
     assert response.headers["content-type"].startswith("text/html")
     assert "fetch('api/chat'" in response.text and "fetch('api/voices')" in response.text
     assert "fetch('/" not in response.text  # absolute URLs would miss the route prefix
+    assert f'<span id="version">{serve_chat.VERSION}</span>' in response.text
 
 
 def test_health(client, backends):
     assert client.get("/health").json() == {
         "status": "ok",
+        "version": serve_chat.VERSION,
         "stt": f"{backends.url}/v1",
         "llm": f"{backends.url}/llm",
         "llm_model": "tiny-llm",
