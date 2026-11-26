@@ -43,17 +43,19 @@ def client(replica):
 
 def transcribe(client, audio=None, **fields):
     audio = wav_bytes(tone(seconds=1.0, rate=16000), 16000) if audio is None else audio
-    return client.post("/audio/transcriptions", files={"file": ("a.wav", audio, "audio/wav")}, data=fields)
+    return client.post("/v1/audio/transcriptions", files={"file": ("a.wav", audio, "audio/wav")}, data=fields)
 
 
 def test_health_and_models(client):
-    assert client.get("/health").json() == {
+    assert client.get("/v1/health").json() == {
         "status": "ok",
         "version": serve_stt.VERSION,
         "model": "openai/whisper-tiny",
         "device": "CPU / CUDA none",
+        "languages": TO_LANGUAGE_CODE,  # for serve_meeting's language menu
     }
-    assert client.get("/models").json() == {
+    assert TO_LANGUAGE_CODE["mandarin"] == "zh"
+    assert client.get("/v1/models").json() == {
         "object": "list",
         "data": [{"id": "openai/whisper-tiny", "object": "model", "owned_by": "local"}],
     }
@@ -132,19 +134,19 @@ def test_invalid_requests(client, replica, kwargs, message):
 
 
 def test_missing_file(client):
-    response = client.post("/audio/transcriptions", files={"other": ("a.wav", b"x")})
+    response = client.post("/v1/audio/transcriptions", files={"other": ("a.wav", b"x")})
     assert response.status_code == 400
     assert response.json() == {"error": {"message": "Missing audio file field"}}
 
 
 def test_not_multipart(client):
-    response = client.post("/audio/transcriptions", json={"file": "x"})
+    response = client.post("/v1/audio/transcriptions", json={"file": "x"})
     assert response.status_code == 400
     assert response.json() == {"error": {"message": "Request must be multipart/form-data"}}
 
 
 def test_empty_body(client):
-    response = client.post("/audio/transcriptions", content=b"")
+    response = client.post("/v1/audio/transcriptions", content=b"")
     assert response.status_code == 400
 
 
@@ -176,27 +178,15 @@ def test_multipart_fields_keeps_binary_payload():
 
 
 def test_page_uses_relative_urls(client):
+    """A plain recording page; meeting notes and anything fancier are serve_meeting's, so they don't reload Whisper."""
     response = client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/html; charset=utf-8"
     assert response.headers["cache-control"] == "no-store"
-    assert "fetch('audio/transcriptions'" in response.text
-    assert "new URL('audio/stream', location.href)" in response.text
-    assert "fetch('/" not in response.text  # absolute URLs would miss the /v1 route prefix
+    assert "fetch('v1/audio/transcriptions'" in response.text
+    assert "fetch('/" not in response.text  # absolute URLs would miss a route prefix
+    assert "WebSocket" not in response.text and "localStorage" not in response.text
     assert f'<span id="version">{serve_stt.VERSION}</span>' in response.text
-
-
-def test_page_language_picker_knows_whispers_languages(client):
-    import re
-
-    page = client.get("/").text
-    found = re.search(r"const LANGUAGE_CODES = (\{.*?\});", page)
-    assert found
-    codes = json.loads(found.group(1))
-    assert codes == TO_LANGUAGE_CODE and codes["mandarin"] == "zh"
-    presets = re.findall(r'<option value="([a-z]+)">', page)
-    assert presets == ["english", "chinese", "spanish", "french", "korean", "japanese", "other"]
-    assert all(p in codes for p in presets[:-1])  # each preset is a name the server accepts
 
 
 FRAME = serve_stt.Segmenter.FRAME / 16000  # seconds
@@ -323,7 +313,7 @@ def pcm(audio):
 def stream(client, audio, query=""):
     """Events of a live transcription of `audio`, sent in 0.1 s chunks."""
     events: list[dict] = []
-    with client.websocket_connect(f"/audio/stream{query}") as ws:
+    with client.websocket_connect(f"/v1/audio/stream{query}") as ws:
         for i in range(0, len(audio), 1600):
             ws.send_bytes(pcm(audio[i : i + 1600]))
         ws.send_text(json.dumps({"type": "stop"}))
@@ -401,7 +391,7 @@ def test_stream_reports_failed_pieces_and_goes_on(client, replica):
 
 
 def test_stream_rejects_unknown_language(client, replica):
-    with client.websocket_connect("/audio/stream?language=klingon") as ws:
+    with client.websocket_connect("/v1/audio/stream?language=klingon") as ws:
         assert ws.receive_json() == {"type": "error", "message": "Unknown language: klingon"}
     assert not replica.calls
 
@@ -434,7 +424,7 @@ def test_cancelled_transcription_keeps_the_gpu_until_it_finishes(replica):
 
 
 def test_stream_ignores_other_text_messages(client, replica):
-    with client.websocket_connect("/audio/stream") as ws:
+    with client.websocket_connect("/v1/audio/stream") as ws:
         ws.send_text("not json")
         ws.send_text(json.dumps(["stop"]))
         ws.send_bytes(pcm(speech(1.0)) + b"\x00")  # the odd byte is dropped

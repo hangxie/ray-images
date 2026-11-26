@@ -1,58 +1,32 @@
-// Runs stt.html's script against fake browser APIs (DOM, Web Audio, WebSocket, storage): the language picker, and a
-// meeting from the first audio frame to `done`. Usage: node stt_page.js <script.js>; exits 1 on a failed check.
+// Runs stt.html's script against fake browser APIs (DOM, Web Audio, fetch): one recording from Record to its text.
+// Usage: node stt_page.js <script.js>; exits 1 on a failed check.
 const fs = require('fs');
 const vm = require('vm');
 
 const elements = {};
-function element(id) {
-  return elements[id] ??= {
-    id, value: '', textContent: '', hidden: false, disabled: false, className: '', style: {}, children: [], options: [],
-    classList: {
-      set: new Set(),
-      toggle(c, on) { on ? this.set.add(c) : this.set.delete(c); }, add(c) { this.set.add(c); }, remove(c) { this.set.delete(c); },
-    },
-    append(...c) { this.children.push(...c); }, replaceChildren(...c) { this.children = c; },
-    scrollIntoView() {}, focus() { document.activeElement = this; }, remove() { this.removed = true; },
-    addEventListener(type, fn) { this['on' + type] = fn; },
-    get firstChild() { return this.children[0]; },
-  };
-}
-let created = 0;
-const document = {
-  activeElement: null, visibilityState: 'visible',
-  getElementById: element,
-  createElement: tag => Object.assign(element(`_${created++}`), {tagName: tag.toUpperCase()}),
-  createTextNode: text => ({textContent: text}),
-  addEventListener() {},
+const element = id => elements[id] ??= {
+  id, textContent: '', className: '', children: [],
+  classList: {set: new Set(), add(c) { this.set.add(c); }, remove(c) { this.set.delete(c); }},
+  append(...c) { this.children.push(...c); }, scrollIntoView() {},
 };
-const $ = element;
-$('language').tagName = 'SELECT';
-$('language').options = ['', 'english', 'chinese', 'spanish', 'french', 'korean', 'japanese', 'other'].map(value => ({value}));
-
-const sockets = [];
-class WebSocket {
-  static OPEN = 1;
-  constructor(url) { this.url = String(url); this.readyState = 0; this.sent = []; sockets.push(this); }
-  send(data) { this.sent.push(data); }
-  close() { this.readyState = 3; }
-}
-let port;
-const storage = {language: 'German'};  // free text saved by the page before the language menu
+const document = {getElementById: element, createElement: () => element(`_${Object.keys(elements).length}`)};
+let port, refuse = true, uploads = [], answer = {status: 200, body: {text: 'Hello world.', language: 'english', duration: 1.0}};
 const context = {
-  document, WebSocket, console, setTimeout, setInterval,
-  URL: Object.assign(class extends URL {}, {createObjectURL: () => 'blob:worklet', revokeObjectURL() {}}),
-  Blob: class {},
-  Option: class { constructor(text) { this.text = this.value = text; } },
+  document, console,
+  URL: {createObjectURL: () => 'blob:worklet'},
+  Blob: class { constructor(parts, options) { this.parts = parts; this.type = options?.type; } },
+  FormData: class { constructor() { this.fields = {}; } append(name, value, filename) { this.fields[name] = {value, filename}; } },
   AudioContext: class {
-    sampleRate = 48000; currentTime = 0; audioWorklet = {addModule: async () => {}};
+    sampleRate = 48000; audioWorklet = {addModule: async () => {}};
     createMediaStreamSource() { return {connect() {}}; }
-    resume() {}
+    async resume() {}
   },
   AudioWorkletNode: class { constructor() { port = this.port = {}; } },
-  location: {href: 'https://stt.example/v1/', protocol: 'https:'},
-  localStorage: {getItem: k => storage[k] ?? null, setItem: (k, v) => { storage[k] = v; }},
-  navigator: {mediaDevices: {getUserMedia: async () => ({})}},
-  confirm: () => true,
+  navigator: {mediaDevices: {getUserMedia: async () => { if (refuse) { refuse = false; throw Object.assign(new Error('Permission denied'), {name: 'NotAllowedError'}); } return {}; }}},
+  fetch: async (url, init) => {
+    uploads.push({url, form: init.body});
+    return {ok: answer.status === 200, status: answer.status, statusText: 'error', json: async () => answer.body};
+  },
 };
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(process.argv[2], 'utf8'), context);
@@ -62,60 +36,39 @@ function check(ok, what) {
   console.log(ok ? 'ok  ' : 'FAIL', what);
   if (!ok) failed++;
 }
-const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)});
+const $ = element;
+const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
 (async () => {
-  check($('language').value === 'other' && $('language-other').value === 'german' && !$('language-other').hidden,
-    'saved free text restores as Other');
-  $('language-other').value = 'klingon';
-  $('language-other').oninput();
-  check($('language-other').classList.set.has('invalid') && /auto-detect/.test($('status').textContent),
-    'an unknown language is marked and falls back to auto-detect');
-  $('language').value = 'chinese';
-  $('language').onchange();
-  check($('language-other').hidden && storage.language === 'chinese', 'a preset hides Other and is saved');
+  await $('record').onclick();
+  check(/^Microphone blocked: allow it/.test($('status').textContent) && !$('record').classList.set.has('on'),
+    'a refused microphone says how to allow it');
+  await $('record').onclick();
+  check($('record').textContent === 'Stop' && $('record').classList.set.has('on'), 'Record retries and starts recording');
+  for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128).fill(0.5)});  // 1 s at 48 kHz
+  await $('record').onclick();
+  await settle();
+  check(uploads.length === 1 && uploads[0].url === 'v1/audio/transcriptions', 'Stop uploads to v1/audio/transcriptions');
+  const file = uploads[0].form.fields.file, view = new DataView(file.value.parts[0]);
+  check(file.filename === 'speech.wav' && file.value.type === 'audio/wav' && !uploads[0].form.fields.language,
+    'as speech.wav, with the language left to the server');
+  check(view.getUint32(24, true) === 16000 && view.getUint32(40, true) === 16000 * 2, 'as 1 s of 16 kHz 16-bit WAV');
+  check(view.getInt16(44, true) === Math.trunc(0.5 * 0x7fff), 'with the recorded level');
+  check($('log').children.at(-1).textContent === 'Hello world.' && /english/.test($('status').textContent),
+    'the text is shown');
 
-  await $('meeting').onclick();
-  const socket = sockets[0];
-  check(socket?.url === 'wss://stt.example/v1/audio/stream?language=chinese', `stream URL ${socket?.url}`);
-  const frame = new Float32Array(128).fill(0.1);  // what the worklet posts, at 48 kHz
-  for (let i = 0; i < 40; i++) port.onmessage({data: frame});
-  check(socket.sent.length === 0, 'audio waits for the socket to open');
-  socket.readyState = WebSocket.OPEN;
-  for (let i = 0; i < 40; i++) port.onmessage({data: frame});
-  const pcm = socket.sent.map(b => new Int16Array(b));
-  const samples = pcm.reduce((n, p) => n + p.length, 0);
-  // 41 frames go once the socket is open, then 38 at the next 0.1 s; the last one waits.
-  check(pcm.length === 2 && samples === Math.floor(41 * 128 / 3) + Math.floor(38 * 128 / 3) && pcm[0][0] === Math.trunc(0.1 * 0x7fff),
-    `frames go out as 16 kHz PCM (${samples} samples in ${pcm.length} messages)`);
-  deliver(socket, {type: 'partial', start: 0, text: '你'});
-  deliver(socket, {type: 'partial', start: 0, text: '你好'});
-  const live = $('log').children.filter(c => c.className === 'entry pending');
-  check(live.length === 1 && live[0].firstChild.textContent === '你好', 'partials update one grey line');
-  deliver(socket, {type: 'segment', start: 0, end: 5, text: '你好', language: 'chinese', paragraph: true, seconds: 0.4});
-  check(live[0].removed, 'the segment replaces the partial');
-  deliver(socket, {type: 'segment', start: 5, end: 9, text: '世界', language: 'chinese', paragraph: false, seconds: 0.3});
-  deliver(socket, {type: 'segment', start: 12, end: 14, text: 'Next.', language: 'chinese', paragraph: true, seconds: 0.3});
-  const saved = JSON.parse(storage.transcript);
-  check(saved.length === 2 && saved[0].text === '你好 世界' && saved[0].segments.length === 2,
-    'pieces join into paragraphs');
-  // New note in the middle of a meeting: the transcript and the grey line go, and the meeting carries on.
-  deliver(socket, {type: 'partial', start: 15, text: 'Half'});
-  const half = $('log').children.at(-1);
-  $('new-note').onclick();
-  check(JSON.parse(storage.transcript).length === 0 && half.removed === true, 'New note clears the transcript');
-  deliver(socket, {type: 'partial', start: 15, text: 'Half a'});
-  check($('log').children.length === 1 && $('log').children[0].firstChild.textContent === 'Half a',
-    'the next partial shows in the new note');
-  deliver(socket, {type: 'segment', start: 15, end: 17, text: 'Half a sentence.', language: 'chinese', paragraph: false, seconds: 0.2});
-  const fresh = JSON.parse(storage.transcript);
-  check(fresh.length === 1 && fresh[0].text === 'Half a sentence.', 'the meeting goes on in the new note');
-  $('meeting').onclick();
-  check(JSON.parse(socket.sent.at(-1)).type === 'stop' && $('meeting').disabled, 'Stop sends stop and waits');
-  deliver(socket, {type: 'done'});
-  check(!$('meeting').disabled && $('meeting').textContent === 'Meeting: off', 'done ends the meeting');
-  port.onmessage({data: frame});  // the microphone keeps running after the meeting
-  check(socket.sent.length === pcm.length + 2, 'nothing is sent after the meeting');
+  await $('record').onclick();
+  port.onmessage({data: new Float32Array(128)});
+  await $('record').onclick();
+  check(uploads.length === 1 && $('status').textContent === 'Too short', 'a too-short recording is not uploaded');
+
+  answer = {status: 503, body: {error: {message: 'busy'}}};
+  await $('record').onclick();
+  for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128)});
+  await $('record').onclick();
+  await settle();
+  const last = $('log').children.at(-1);
+  check(last.className === 'error' && last.textContent === 'Transcription failed: busy', 'an error is shown');
   process.exit(failed ? 1 : 0);
 })().catch(err => {
   console.log('ERROR', err);

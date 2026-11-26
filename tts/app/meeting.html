@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meeting notes</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 0 auto; padding: 1rem; color: #222; }
+  header { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 1; background: white; padding: .5rem 0; border-bottom: 1px solid #e2e8f0; }
+  h1 { font-size: 1.3rem; margin: 0 auto 0 0; }
+  #version { font-size: .75rem; font-weight: normal; color: #64748b; }
+  #language-other { width: 8rem; }
+  #language-other.invalid { border-color: #dc2626; outline-color: #dc2626; background: #fef2f2; }
+  #log { margin: 1rem 0; display: flex; flex-direction: column; gap: .5rem; min-height: 40vh; }
+  .entry { padding: .5rem .75rem; border-radius: .6rem; background: #f1f5f9; white-space: pre-wrap; }
+  .entry.pending { color: #64748b; font-style: italic; }
+  .meta { font-size: .75rem; color: #64748b; margin-top: .25rem; font-style: normal; }
+  .error { color: #b91c1c; font-size: .85rem; }
+  #meeting { width: 100%; padding: 1.2rem; font-size: 1.1rem; border-radius: .8rem; border: none; background: #2563eb; color: white; }
+  #meeting.on { background: #dc2626; }
+  #meeting:disabled { opacity: .7; }
+  .actions { display: flex; gap: .5rem; margin-top: .75rem; }
+  #status { font-size: .85rem; color: #475569; margin-top: .5rem; min-height: 1.2em; }
+  #meter { height: 4px; background: #e2e8f0; border-radius: 2px; margin-top: .4rem; overflow: hidden; visibility: hidden; }
+  #meter.on { visibility: visible; }
+  #level { height: 100%; width: 0; background: #94a3b8; transition: width 50ms linear; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meeting notes <span id="version">{{VERSION}}</span></h1>
+  <label>Language <select id="language">
+    <option value="">Auto-detect</option>
+    <option value="english">English</option>
+    <option value="chinese">Chinese</option>
+    <option value="spanish">Spanish</option>
+    <option value="french">French</option>
+    <option value="korean">Korean</option>
+    <option value="japanese">Japanese</option>
+    <option value="other">Other…</option>
+  </select></label>
+  <input id="language-other" placeholder="type a language" list="languages" autocomplete="off" hidden aria-label="Other language">
+  <datalist id="languages"></datalist>
+</header>
+<div id="log"></div>
+<button id="meeting" type="button">Start meeting</button>
+<div id="meter"><div id="level"></div></div>
+<div class="actions">
+  <button id="copy" type="button">Copy</button>
+  <button id="download" type="button">Download</button>
+  <button id="subtitles" type="button">Subtitles (.vtt)</button>
+  <button id="new-note" type="button">New note</button>
+</div>
+<div id="status"></div>
+<script>
+const $ = id => document.getElementById(id);
+const TARGET_RATE = 16000;
+let ctx, recorder, wakeLock = null;
+const meter = {at: 0, peak: 0};
+// A meeting streams the microphone to api/stream, which hands it to STT; STT cuts it at pauses and sends back
+// timestamped pieces of text, and pieces join into paragraphs. null when off.
+let meeting = null;
+// The transcript survives a reload: [{at, text, meta, segments: [{start, end, text}]}], times in ms since the epoch.
+let transcript = JSON.parse(localStorage.getItem('transcript') || '[]');
+
+function status(text) { $('status').textContent = text; }
+function idleStatus() {
+  if (!meeting) { status(''); return; }
+  const seconds = Math.floor((Date.now() - (meeting.at ?? Date.now())) / 1000);
+  const time = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+  status(meeting.stopping ? 'Transcribing the rest…' : `Recording ${time}`);
+}
+function save() { localStorage.setItem('transcript', JSON.stringify(transcript)); }
+function clock(at) { return new Date(at).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', second: '2-digit'}); }
+
+function entry(text, meta, className = 'entry') {
+  const div = document.createElement('div');
+  div.className = className;
+  div.append(document.createTextNode(text));
+  const small = document.createElement('div');
+  small.className = 'meta';
+  small.textContent = meta;
+  div.append(small);
+  $('log').append(div);
+  div.scrollIntoView({block: 'end'});
+  return {div, text: div.firstChild, meta: small};
+}
+
+// Whisper's languages, English name (and aliases such as mandarin) -> code, filled in by the server from STT's
+// /health; empty while STT is unreachable, and then Other… falls back to auto-detect.
+const LANGUAGE_CODES = {{LANGUAGES}};
+const KNOWN = new Set([...Object.keys(LANGUAGE_CODES), ...Object.values(LANGUAGE_CODES)]);
+$('languages').replaceChildren(...Object.keys(LANGUAGE_CODES).sort().map(name => new Option(name)));
+
+// The language sent with the stream: '' (auto-detect) for Auto, or for Other when Whisper doesn't know it.
+function language() {
+  if ($('language').value !== 'other') return $('language').value;
+  const typed = $('language-other').value.trim().toLowerCase();
+  return KNOWN.has(typed) ? typed : '';
+}
+function checkLanguage() {
+  const other = $('language').value === 'other', typed = $('language-other').value.trim().toLowerCase();
+  $('language-other').hidden = !other;
+  const invalid = other && !!typed && !KNOWN.has(typed);
+  $('language-other').classList.toggle('invalid', invalid);
+  if (invalid) status(`Whisper doesn't know “${typed}”; using auto-detect until it is fixed.`);
+  else idleStatus();
+}
+function saveLanguage() {
+  localStorage.setItem('language', $('language').value === 'other' ? $('language-other').value.trim() : $('language').value);
+  checkLanguage();
+}
+{
+  // Older pages saved free text; a preset name selects its entry, anything else goes to Other.
+  const saved = (localStorage.getItem('language') || '').toLowerCase();
+  const preset = [...$('language').options].find(o => o.value && o.value !== 'other' && (o.value === saved || LANGUAGE_CODES[o.value] === saved));
+  $('language').value = preset ? preset.value : saved ? 'other' : '';
+  if (!preset && saved) $('language-other').value = saved;
+  checkLanguage();
+}
+$('language').onchange = () => { saveLanguage(); if ($('language').value === 'other') $('language-other').focus(); };
+$('language-other').oninput = saveLanguage;
+
+async function start() {
+  ctx = ctx || new AudioContext();
+  const media = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  const worklet = `registerProcessor('rec', class extends AudioWorkletProcessor {
+    process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } });`;
+  await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
+  const mic = ctx.createMediaStreamSource(media);
+  recorder = new AudioWorkletNode(ctx, 'rec');
+  recorder.port.onmessage = e => {
+    if (!meeting) return;
+    queueFrame(e.data);
+    showLevel(e.data);
+  };
+  mic.connect(recorder);
+}
+
+// STT decides what is speech, so the bar shows only the level.
+function showLevel(frame) {
+  let sum = 0;
+  for (const s of frame) sum += s * s;
+  meter.peak = Math.max(meter.peak, Math.sqrt(sum / frame.length));
+  if (ctx.currentTime - meter.at > 0.05) {
+    meter.at = ctx.currentTime;
+    // -60 dBFS to -10 dBFS spans the bar.
+    const db = 20 * Math.log10(meter.peak + 1e-9);
+    $('level').style.width = `${Math.max(0, Math.min(100, (db + 60) * 2))}%`;
+    meter.peak = 0;
+    idleStatus();
+  }
+}
+
+async function keepAwake() {
+  if (!meeting || !('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+  try { wakeLock = await navigator.wakeLock.request('screen'); } catch {}
+}
+document.addEventListener('visibilitychange', keepAwake);
+
+function downsample(samples, rate) {
+  if (rate <= TARGET_RATE) return samples;
+  const ratio = rate / TARGET_RATE, out = new Float32Array(Math.floor(samples.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const from = Math.floor(i * ratio), to = Math.min(samples.length, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = from; j < to; j++) sum += samples[j];
+    out[i] = sum / Math.max(1, to - from);
+  }
+  return out;
+}
+
+function meetingUi() {
+  $('meeting').textContent = meeting ? (meeting.stopping ? 'Finishing…' : 'Stop meeting') : 'Start meeting';
+  $('meeting').classList.toggle('on', !!meeting);
+  $('meeting').disabled = !!meeting?.stopping;
+  $('meter').classList.toggle('on', !!meeting);
+  idleStatus();
+}
+
+// Browsers remember a refusal for the site and then fail at once without asking again, so say where to undo it.
+function micError(err) {
+  return err.name === 'NotAllowedError'
+    ? 'Microphone blocked: allow it for this site in the browser (the icon by the address bar), then click Start meeting again.'
+    : `Microphone unavailable: ${err.message}`;
+}
+
+async function startMeeting() {
+  if (!recorder) { try { await start(); } catch (err) { status(micError(err)); return; } }
+  await ctx.resume();
+  const url = new URL('api/stream', location.href), lang = language();
+  url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  if (lang) url.searchParams.set('language', lang);
+  const socket = new WebSocket(url);
+  // at: when the stream's first sample was recorded; its pieces' times count from there.
+  const m = meeting = {socket, at: null, frames: [], length: 0, item: null, shown: null, live: null, stopping: false};
+  socket.onmessage = e => onMeetingEvent(m, JSON.parse(e.data));
+  socket.onclose = e => {
+    if (meeting !== m) return;
+    if (!m.stopping) entry(`Meeting connection closed${e.reason ? `: ${e.reason}` : ''}; recording stopped.`, clock(Date.now()), 'error');
+    endMeeting();
+  };
+  keepAwake();
+  meetingUi();
+}
+
+// Frames are sent about every 0.1 s as 16 kHz 16-bit PCM; they wait here until the socket opens.
+function queueFrame(frame) {
+  if (meeting.stopping) return;
+  meeting.at ??= Date.now() - frame.length / ctx.sampleRate * 1000;
+  meeting.frames.push(frame); meeting.length += frame.length;
+  if (meeting.length >= ctx.sampleRate * 0.1) sendFrames();
+}
+
+function sendFrames() {
+  if (meeting.socket.readyState !== WebSocket.OPEN || !meeting.length) return;
+  const samples = new Float32Array(meeting.length);
+  let offset = 0;
+  for (const f of meeting.frames) { samples.set(f, offset); offset += f.length; }
+  meeting.frames = []; meeting.length = 0;
+  const down = downsample(samples, ctx.sampleRate), pcm = new Int16Array(down.length);
+  down.forEach((s, i) => { pcm[i] = Math.max(-1, Math.min(1, s)) * 0x7fff; });
+  meeting.socket.send(pcm.buffer);
+}
+
+function stopMeeting() {
+  if (!meeting || meeting.stopping) return;
+  if (meeting.socket.readyState !== WebSocket.OPEN) { meeting.socket.close(); endMeeting(); return; }
+  sendFrames();
+  meeting.stopping = true;
+  meeting.socket.send(JSON.stringify({type: 'stop'}));
+  meetingUi();
+}
+
+function clearLive(m) {
+  if (m.live) { m.live.div.remove(); m.live = null; }
+}
+
+function endMeeting() {
+  const m = meeting;
+  meeting = null;
+  clearLive(m);
+  if (m.socket.readyState === WebSocket.OPEN) m.socket.close();
+  if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  meetingUi();
+}
+
+function onMeetingEvent(m, event) {
+  if (event.type === 'done') { if (meeting === m) endMeeting(); return; }
+  if (event.type === 'error') { entry(`Transcription failed: ${event.message}`, clock(Date.now()), 'error'); return; }
+  if (event.type === 'partial') {
+    // The piece still being spoken, previewed in grey at the bottom until its segment arrives.
+    m.live ??= entry('', 'still listening…', 'entry pending');
+    m.live.text.textContent = event.text;
+    m.live.div.scrollIntoView({block: 'end'});
+    return;
+  }
+  if (event.type !== 'segment') return;
+  clearLive(m);
+  const start = m.at + event.start * 1000, end = m.at + event.end * 1000;
+  if (event.paragraph || !m.item) {
+    m.item = {at: start, text: '', meta: '', segments: []};
+    transcript.push(m.item);
+    m.shown = entry('', '');
+  }
+  m.item.text += (m.item.text ? ' ' : '') + event.text;
+  m.item.segments.push({start, end, text: event.text});
+  m.item.meta = `${clock(m.item.at)}–${clock(end)} · ${event.language || '?'} · ${event.seconds}s for the last piece`;
+  m.shown.text.textContent = m.item.text;
+  m.shown.meta.textContent = m.item.meta;
+  m.shown.div.scrollIntoView({block: 'end'});
+  save();
+}
+
+// Entries saved before segments were kept have no end time.
+function segments(e) { return e.segments || [{start: e.at, end: e.at, text: e.text}]; }
+
+function transcriptText() { return transcript.map(e => e.text).join('\n') + (transcript.length ? '\n' : ''); }
+function timestampedText() { return transcript.map(e => `[${clock(e.at)}] ${e.text}\n`).join(''); }
+
+function vtt() {
+  const origin = transcript.length ? segments(transcript[0])[0].start : 0;
+  const time = ms => {
+    const t = Math.max(0, Math.round(ms - origin)), pad = (n, w = 2) => String(n).padStart(w, '0');
+    return `${pad(Math.floor(t / 3600000))}:${pad(Math.floor(t / 60000) % 60)}:${pad(Math.floor(t / 1000) % 60)}.${pad(t % 1000, 3)}`;
+  };
+  const cues = transcript.flatMap(segments).map(s => `${time(s.start)} --> ${time(Math.max(s.end, s.start + 1000))}\n${s.text}`);
+  return ['WEBVTT', ...cues].join('\n\n') + '\n';
+}
+
+function saveAs(text, type, extension) {
+  const link = document.createElement('a'), stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+  link.href = URL.createObjectURL(new Blob([text], {type}));
+  link.download = `transcript-${stamp}.${extension}`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(link.href), 1000);
+}
+
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(transcriptText()); status('Copied'); }
+  catch (err) { status(`Copy failed: ${err.message}`); }
+};
+$('download').onclick = () => saveAs(timestampedText(), 'text/plain', 'txt');
+$('subtitles').onclick = () => saveAs(vtt(), 'text/vtt', 'vtt');
+$('new-note').onclick = () => {
+  if (transcript.length && !confirm('Start a new note? The current transcript will be cleared; download it first to keep it.')) return;
+  transcript = []; save();
+  if (meeting) { meeting.item = null; clearLive(meeting); }  // a running meeting carries on into the new note
+  $('log').replaceChildren();
+  status('New note');
+};
+
+$('meeting').onclick = () => (meeting ? stopMeeting() : startMeeting());
+for (const e of transcript) entry(e.text, e.meta);
+</script>
+</body>
+</html>

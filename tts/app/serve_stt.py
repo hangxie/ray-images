@@ -1,10 +1,10 @@
 """Ray Serve speech-to-text service: Whisper (transformers / PyTorch on CUDA) behind OpenAI's transcription API.
 
-Port of site-up's ai/mlx-stt-svc with the same HTTP surface under the application's route prefix (/v1), plus a
-recording page at `GET /` (stt.html) and a WebSocket at `/audio/stream` that transcribes a live recording as it goes.
-It runs in the TTS virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and
-scipy; the stream adds only silero-vad. As in serve_tts, module-level imports are limited to what both environments
-have.
+Port of site-up's ai/mlx-stt-svc with the same HTTP surface under /v1, plus a plain recording page at `GET /` (stt.html)
+and a WebSocket at `/v1/audio/stream` that transcribes a live recording as it goes, for serve_meeting's page. The routes
+carry /v1 themselves, so the app mounts at `/` (or any prefix) with the page at its root. It runs in the TTS
+virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and scipy; the stream
+adds only silero-vad. As in serve_tts, module-level imports are limited to what both environments have.
 """
 
 import asyncio
@@ -251,20 +251,19 @@ class STT:
     @api.get("/")
     def page(self):
         page = (ROOT / "stt.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
-        page = page.replace(
-            "{{LANGUAGES}}", json.dumps(self.language_codes, sort_keys=True)
-        )  # Whisper's, for the picker
         return reply(200, page.encode(), "text/html; charset=utf-8")
 
-    @api.get("/health")
+    @api.get("/v1/health")
     def health(self):
-        return reply(200, {"status": "ok", "version": VERSION, "model": self.model_id, "device": self.device})
+        # languages: Whisper's, English name (and aliases such as mandarin) -> code, for serve_meeting's menu
+        status = {"status": "ok", "version": VERSION, "model": self.model_id, "device": self.device}
+        return reply(200, {**status, "languages": self.language_codes})
 
-    @api.get("/models")
+    @api.get("/v1/models")
     def models(self):
         return reply(200, {"object": "list", "data": [{"id": self.model_id, "object": "model", "owned_by": "local"}]})
 
-    @api.post("/audio/transcriptions")
+    @api.post("/v1/audio/transcriptions")
     async def transcriptions(self, request: Request):
         try:
             body = await request.body()
@@ -303,7 +302,7 @@ class STT:
             headers=headers,
         )
 
-    @api.websocket("/audio/stream")
+    @api.websocket("/v1/audio/stream")
     async def stream(self, websocket: WebSocket):
         """Live transcription of one long recording.
 
