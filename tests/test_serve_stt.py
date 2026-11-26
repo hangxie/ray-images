@@ -41,7 +41,12 @@ def transcribe(client, audio=None, **fields):
 
 
 def test_health_and_models(client):
-    assert client.get("/health").json() == {"status": "ok", "model": "openai/whisper-tiny", "device": "CPU / CUDA none"}
+    assert client.get("/health").json() == {
+        "status": "ok",
+        "version": serve_stt.VERSION,
+        "model": "openai/whisper-tiny",
+        "device": "CPU / CUDA none",
+    }
     assert client.get("/models").json() == {
         "object": "list",
         "data": [{"id": "openai/whisper-tiny", "object": "model", "owned_by": "local"}],

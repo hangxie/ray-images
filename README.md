@@ -94,6 +94,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 `GET /` (page), `GET /health`, `GET /voices`, and `POST /api/tts` keep the MLX service's fields, ranges, error codes, and headers, so its `index.html` and `txt2mp3.sh` work unchanged. Point `TTS_URL` at the new endpoint.
 
 - `X-Peak-CUDA-GB` replaces `X-Peak-MLX-GB`, and `/health` reports the CUDA device.
+- The page title and `/health` show the image tag from the `VERSION` file the build writes next to the app, as in [Voice chat](#voice-chat); STT's `/v1/health` reports it too.
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
 - `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
@@ -194,7 +195,7 @@ Mount it at its own route prefix, for example `route_prefix: /chat`, and open th
 - A turn is one streamed request that mostly waits on the backends, so a replica takes up to `CHAT_MAX_ONGOING_REQUESTS` turns at once instead of TTS's one.
 - A client that disconnects cancels its turn: the replica shuts its in-flight STT, LLM, and TTS connections, so TTS stops synthesizing at the next frame.
 - Backend connections are kept alive and shared by a replica's turns, so STT calls and TTS sentences skip the TCP and TLS handshakes; through the homelab's HTTPS Gateway the handshake was ~28 of the ~33 ms each call cost. A connection is reused only after its response was read to the end, a pooled one the server has closed is replaced on the next request, and an interrupted turn's connections are closed, not pooled. The streamed LLM reply's connection is closed after `[DONE]`, since it is one call per turn.
-- The page header and `/health` show the image tag, which the build writes to `VERSION` next to the app; it reads `dev` outside the image.
+- The page header and `/health` show the image tag, which the build writes to `VERSION` next to the app; it reads `dev` outside the image. TTS and STT report it the same way.
 - There is no client-IP allowlist, unlike on `media`; access control belongs to the deployment in front, as for TTS and STT. The `CHAT_*_TOKEN`s are only what the replica sends to its backends, for example a PAT when TTS sits behind the Gateway's bearer check.
 
 | Setting | Default | Effect |

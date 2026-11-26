@@ -10,6 +10,7 @@ import asyncio
 import base64
 import contextlib
 import functools
+import html
 import io
 import json
 import logging
@@ -27,6 +28,7 @@ from ray import serve
 from starlette.exceptions import HTTPException
 
 ROOT = Path(__file__).resolve().parent
+VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
 # Sampling options exposed for Base cloning (ICL): name -> (type, fallback default, min, max). Defaults come from the
 # model's generation_config.json when it sets them. A None default means the option is derived per request when omitted.
 # Unlike mlx-audio, qwen-tts passes repetition_penalty through unchanged in ICL mode, so there is no 1.5 floor.
@@ -429,7 +431,8 @@ class TTS:
 
     @api.get("/")
     def page(self):
-        return reply(200, (ROOT / "index.html").read_bytes(), "text/html; charset=utf-8")
+        page = (ROOT / "index.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
+        return reply(200, page.encode(), "text/html; charset=utf-8")
 
     @api.get("/health")
     def health(self):
@@ -437,6 +440,7 @@ class TTS:
             200,
             {
                 "status": "ok",
+                "version": VERSION,
                 "model": self.model_id,
                 "device": self.device,
                 "cuda_graphs": self.cuda_graphs,

@@ -12,8 +12,9 @@ section {background: white; padding: 1.2rem; margin: 1rem 0; border-radius: .6re
 select {max-width: 100%} #message, .warn {color: #a32222} .muted {color: #526173; font-size: .9rem}
 details {margin: .8rem 0} summary {cursor: pointer} #settings label {display: inline-block; margin: .3rem 1rem .3rem 0} #settings input {width: 5.5rem}
 #pieces {padding-left: 1.6rem} #pieces li {margin: .5rem 0} #pieces li.playing {font-weight: 600} #pieces audio {height: 2rem; margin-top: .2rem}
+#version {font-size: .75rem; font-weight: normal; color: #64748b}
 </style>
-<h1>ray-tts</h1>
+<h1>ray-tts <span id="version">{{VERSION}}</span></h1>
 <p id="model" class="muted">Loading model details…</p>
 <section>
 <h2>Generate speech</h2>
