@@ -99,6 +99,17 @@ const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)
   const saved = JSON.parse(storage.transcript);
   check(saved.length === 2 && saved[0].text === '你好 世界' && saved[0].segments.length === 2,
     'pieces join into paragraphs');
+  // New note in the middle of a meeting: the transcript and the grey line go, and the meeting carries on.
+  deliver(socket, {type: 'partial', start: 15, text: 'Half'});
+  const half = $('log').children.at(-1);
+  $('new-note').onclick();
+  check(JSON.parse(storage.transcript).length === 0 && half.removed === true, 'New note clears the transcript');
+  deliver(socket, {type: 'partial', start: 15, text: 'Half a'});
+  check($('log').children.length === 1 && $('log').children[0].firstChild.textContent === 'Half a',
+    'the next partial shows in the new note');
+  deliver(socket, {type: 'segment', start: 15, end: 17, text: 'Half a sentence.', language: 'chinese', paragraph: false, seconds: 0.2});
+  const fresh = JSON.parse(storage.transcript);
+  check(fresh.length === 1 && fresh[0].text === 'Half a sentence.', 'the meeting goes on in the new note');
   $('meeting').onclick();
   check(JSON.parse(socket.sent.at(-1)).type === 'stop' && $('meeting').disabled, 'Stop sends stop and waits');
   deliver(socket, {type: 'done'});

@@ -52,7 +52,7 @@
   <button id="copy" type="button">Copy</button>
   <button id="download" type="button">Download</button>
   <button id="subtitles" type="button">Subtitles (.vtt)</button>
-  <button id="clear" type="button">Clear</button>
+  <button id="new-note" type="button">New note</button>
 </div>
 <div id="status"></div>
 <script>
@@ -453,12 +453,12 @@ $('copy').onclick = async () => {
 };
 $('download').onclick = () => saveAs(timestampedText(), 'text/plain', 'txt');
 $('subtitles').onclick = () => saveAs(vtt(), 'text/vtt', 'vtt');
-$('clear').onclick = () => {
-  if (transcript.length && !confirm('Clear the transcript?')) return;
+$('new-note').onclick = () => {
+  if (transcript.length && !confirm('Start a new note? The current transcript will be cleared; download it first to keep it.')) return;
   transcript = []; save();
-  if (meeting) meeting.item = null;  // the next piece starts a new paragraph
+  if (meeting) { meeting.item = null; clearLive(meeting); }  // a running meeting carries on into the new note
   $('log').replaceChildren();
-  idleStatus();
+  status('New note');
 };
 
 $('talk').addEventListener('pointerdown', e => { e.preventDefault(); pressTalk(); });
