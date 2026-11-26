@@ -542,14 +542,18 @@ class TTS:
         )
 
         async def body():
+            finished = False
             try:
                 while True:
                     event = await events.get()
                     yield json.dumps(event) + "\n"
                     if event["type"] in ("done", "error"):
+                        finished = True
                         break
             finally:
-                if not task.done():
+                # Not `task.done()`: the thread emits `done` just before it returns, so a finished stream usually still
+                # sees the task running here.
+                if not finished:
                     # The client disconnected: stop at the next codec frame so this replica is idle before Serve routes
                     # it the next queued request.
                     job.stop.set()
