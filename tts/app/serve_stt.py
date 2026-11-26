@@ -8,6 +8,7 @@ environments have.
 """
 
 import asyncio
+import collections
 import email.parser
 import email.policy
 import html
@@ -103,13 +104,16 @@ class Segmenter:
     """Cuts a live 16 kHz stream into pieces for Whisper at short pauses, so text keeps up with long speech.
 
     Past `min_seconds` the next `pause_seconds` of quiet ends a piece; at `max_seconds` it ends after the quietest
-    20 ms frame past `min_seconds`. Levels are compared with an adaptive noise floor, as on the voice chat page. A
-    piece is trimmed to its speech plus `margin_seconds`, and one with less than `min_speech_seconds` of speech is
-    dropped (Whisper makes up text from silence). A piece starts a paragraph after `paragraph_seconds` without speech.
-    Times are seconds from the start of the stream.
+    20 ms frame past `min_seconds`. Speech and quiet are judged against the noise floor, the lowest 20 ms level of the
+    last `floor_seconds` (speech always has gaps between syllables), so they don't depend on the microphone's gain;
+    only levels under -54 dBFS never count as speech. A piece is trimmed to its speech plus `margin_seconds`, and one
+    with less than `min_speech_seconds` of speech is dropped (Whisper makes up text from silence). A piece starts a
+    paragraph after `paragraph_seconds` without speech. Times are seconds from the start of the stream.
     """
 
     FRAME = SAMPLE_RATE // 50
+    MIN_SPEECH_LEVEL = 0.002  # -54 dBFS
+    MIN_FLOOR = 0.0005
 
     def __init__(
         self,
@@ -119,6 +123,7 @@ class Segmenter:
         paragraph_seconds=2.0,
         min_speech_seconds=0.3,
         margin_seconds=0.3,
+        floor_seconds=5.0,
     ):
         def frames(seconds):
             return max(1, int(np.ceil(seconds * 50 - 1e-6)))
@@ -128,15 +133,17 @@ class Segmenter:
         self.min_speech_frames, self.paragraph_seconds = frames(min_speech_seconds), paragraph_seconds
         self.audio = np.zeros(0, dtype=np.float32)  # the current piece, starting on a frame boundary
         self.levels: list[float] = []  # RMS of each whole frame of the current piece
+        self.recent: collections.deque[float] = collections.deque(maxlen=frames(floor_seconds))
         self.start = 0  # stream sample where the current piece starts
-        self.floor = 0.005
+        self.floor = self.MIN_FLOOR
         self.last_speech: float | None = None  # stream time where the previous piece's speech ended
+        self.peak = 0.0  # the loudest frame so far, for the stream's log line
 
     def speech(self, level):
-        return level > max(0.01, self.floor * 3)
+        return level > max(self.MIN_SPEECH_LEVEL, self.floor * 3)
 
     def quiet(self, level):
-        return level < max(0.006, self.floor * 2)
+        return level < max(self.MIN_SPEECH_LEVEL * 0.75, self.floor * 2)
 
     def feed(self, samples):
         """Pieces completed by `samples`: dicts with start, end, audio, and paragraph."""
@@ -146,9 +153,8 @@ class Segmenter:
             i = len(self.levels)
             level = float(np.sqrt(np.mean(np.square(self.audio[i * self.FRAME : (i + 1) * self.FRAME]))))
             self.levels.append(level)
-            if not self.speech(level):  # the floor follows quiet quickly and rises slowly
-                self.floor += (level - self.floor) * min(1.0, 0.02 / (0.3 if level < self.floor else 3.0))
-                self.floor = max(self.floor, 0.001)
+            self.recent.append(level)
+            self.floor, self.peak = max(min(self.recent), self.MIN_FLOOR), max(self.peak, level)
             n = len(self.levels)
             if n >= self.min_frames and all(self.quiet(v) for v in self.levels[-self.pause_frames :]):
                 pieces += self.cut(n)
@@ -287,11 +293,13 @@ class STT:
             await websocket.close(1008)
             return
         segmenter, pieces = Segmenter(), asyncio.Queue[dict | None]()
+        counts = {"pieces": 0, "segments": 0}
 
         async def transcriber():
             nonlocal language
             context = ""
             while (piece := await pieces.get()) is not None:
+                counts["pieces"] += 1
                 try:
                     started = time.perf_counter()
                     text, found = await self.run(piece["audio"], language, context)
@@ -306,6 +314,7 @@ class STT:
                 event = {"type": "segment", "start": round(piece["start"], 2), "end": round(piece["end"], 2)}
                 event |= {"text": text, "language": self.languages.get(found, found), "paragraph": piece["paragraph"]}
                 await websocket.send_json({**event, "seconds": round(elapsed, 2)})
+                counts["segments"] += 1
 
         worker = asyncio.create_task(transcriber())
         try:
@@ -330,6 +339,14 @@ class STT:
             logger.exception("Live transcription failed")
         finally:
             worker.cancel()
+            logger.info(
+                "Stream ended: %.1f s of audio, %d pieces, %d with text, peak %.1f dBFS, noise floor %.1f dBFS",
+                (segmenter.start + len(segmenter.audio)) / SAMPLE_RATE,
+                counts["pieces"],
+                counts["segments"],
+                20 * np.log10(segmenter.peak + 1e-9),
+                20 * np.log10(segmenter.floor),
+            )
 
     def language(self, value):
         """Whisper's language code for a code or English name, or None (detect) when empty."""

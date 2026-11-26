@@ -184,7 +184,10 @@ def test_page_uses_relative_urls(client):
 
 
 def speech(seconds, amplitude=0.1):
-    return tone(seconds=seconds, rate=16000, amplitude=amplitude)
+    """A tone in 0.2 s syllables with 0.06 s dips to a tenth between them, as speech has."""
+    audio = tone(seconds=seconds, rate=16000, amplitude=amplitude)
+    audio[(np.arange(audio.size) % round(0.26 * 16000)) >= round(0.2 * 16000)] *= 0.1
+    return audio
 
 
 def silence(seconds):
@@ -216,7 +219,7 @@ def test_pause_after_min_seconds_ends_a_piece():
 
 def test_long_speech_is_cut_at_the_quietest_frame_by_max_seconds():
     audio = speech(20.0, amplitude=0.2)
-    audio[round(9.0 * 16000) : round(9.02 * 16000)] *= 0.25  # a dip, still speech, but no pause
+    audio[round(9.0 * 16000) : round(9.02 * 16000)] *= 0.05  # deeper than the gaps between syllables, but no pause
     assert spans(segment(audio)) == [(0.0, 9.02, True), (9.02, 20.0, False)]
 
 
@@ -232,6 +235,19 @@ def test_silence_is_dropped_and_a_long_gap_starts_a_paragraph():
 def test_no_speech_gives_no_pieces():
     assert segment(silence(30.0)) == []
     assert segment(np.concatenate([silence(5.0), speech(0.1), silence(5.0)])) == []
+
+
+def test_quiet_microphone():
+    # Speech at about -50 dBFS, which a fixed -40 dBFS threshold missed entirely.
+    audio = np.concatenate([silence(1.0), speech(3.0, amplitude=0.005), silence(1.0)])
+    assert spans(segment(audio)) == [(0.7, 4.3, True)]
+
+
+def test_steady_loud_noise_is_not_speech():
+    noise = (np.random.default_rng(1).standard_normal(20 * 16000) * 0.03).astype(np.float32)
+    assert segment(noise.copy()) == []
+    noise[10 * 16000 : 13 * 16000] += speech(3.0, amplitude=0.3)
+    assert spans(segment(noise)) == [(10.0, 13.3, True)]  # the noise before it was cut off as a piece at 10 s
 
 
 def test_noise_floor_lets_pauses_through_background_noise():

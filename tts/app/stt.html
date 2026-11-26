@@ -105,7 +105,8 @@ async function start() {
     if (meeting) stream(e.data);
     if (recording) record(e.data);
     if (handsFree) detect(e.data, rms);
-    if (handsFree || meeting) showLevel(rms, meeting ? rms > VAD.minLevel : recording && vad.auto);
+    // In a meeting the server decides what is speech, so the bar shows only the level.
+    if (handsFree || meeting) showLevel(rms, !meeting && recording && vad.auto);
   };
   mic.connect(recorder);
   $('talk').textContent = 'Hold to talk (or hold Space)';
