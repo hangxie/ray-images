@@ -15,7 +15,8 @@ import serve_meeting
 import serve_stt
 import serve_tts
 
-APP = Path(__file__).resolve().parent.parent / "tts" / "app"
+SERVE = Path(__file__).resolve().parent.parent / "serve"
+APPS = [SERVE / name for name in ("tts", "stt", "chat", "meeting")]
 REPLICA_ONLY = [
     "torch",
     "torchaudio",
@@ -49,7 +50,8 @@ print(serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app)
 def test_apps_import_without_replica_packages():
     """Module-level imports stay within what the system environment has (AGENTS.md, Serve app imports)."""
     code = HEAD.format(blocked=REPLICA_ONLY)
-    result = subprocess.run([sys.executable, "-c", code], cwd=APP, capture_output=True, text=True, timeout=120)
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, APPS))}  # as the image sets it
+    result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
 
 
@@ -88,7 +90,7 @@ def test_tts_settings_defaults(monkeypatch):
     assert serve_tts.settings() == {
         "model": "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
         "model_dir": None,
-        "voices_dir": str(APP / "voices"),
+        "voices_dir": str(SERVE / "tts" / "voices"),
         "cuda_graphs": True,
         "kv_cache_tokens": 3072,
         "stream_context_frames": 300,
@@ -107,7 +109,7 @@ def test_replica_runtime_env(monkeypatch, module, variable):
     for name in [n for n in os.environ if n.startswith("HF_")]:
         monkeypatch.delenv(name)
     monkeypatch.delenv(variable, raising=False)
-    assert module.replica_runtime_env() == {"py_executable": "/home/ray/tts-venv/bin/python"}
+    assert module.replica_runtime_env() == {"py_executable": "/home/ray/voice-venv/bin/python"}
 
     monkeypatch.setenv("HF_HUB_OFFLINE", "1")
     monkeypatch.setenv("HF_HOME", "/cache")
@@ -156,3 +158,8 @@ def test_apps_bind_head_settings():
     assert serve_stt.app._bound_deployment.init_args == (serve_stt.settings(),)
     assert serve_chat.app._bound_deployment.init_args == (serve_chat.settings(),)
     assert serve_meeting.app._bound_deployment.init_args == (serve_meeting.settings(),)
+
+
+def test_apps_share_version_file():
+    """The build writes one VERSION file beside the app directories, and every app reads it."""
+    assert {m.VERSION_FILE for m in (serve_tts, serve_stt, serve_chat, serve_meeting)} == {SERVE / "VERSION"}

@@ -1,4 +1,4 @@
-"""tts/check_requirements.py, the venv's stand-in for `pip check`, against this environment's installed packages."""
+"""serve/check_requirements.py, the venv's stand-in for `pip check`, against this environment's installed packages."""
 
 import subprocess
 import sys
@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import check_requirements
 
-SCRIPT = Path(__file__).resolve().parent.parent / "tts" / "check_requirements.py"
+SCRIPT = Path(__file__).resolve().parent.parent / "serve" / "check_requirements.py"
 
 
 def test_satisfied():

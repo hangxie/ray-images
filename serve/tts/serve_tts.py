@@ -1,7 +1,7 @@
 """Ray Serve voice-cloning service using Qwen3-TTS Base (qwen-tts / PyTorch on CUDA).
 
 Port of site-up's ai/mlx-voice-svc with the same HTTP surface. Serve builds the application on the head with the
-image's system Python, whose transformers is vLLM's 5.x; replicas run in the TTS virtualenv (transformers 4.57.3 for
+image's system Python, whose transformers is vLLM's 5.x; replicas run in the voice virtualenv (transformers 4.57.3 for
 qwen-tts) through runtime_env py_executable. Module-level imports are therefore limited to what both environments
 have; torch, transformers and qwen_tts load inside the replica.
 """
@@ -28,7 +28,8 @@ from ray import serve
 from starlette.exceptions import HTTPException
 
 ROOT = Path(__file__).resolve().parent
-VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
+VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
 # Sampling options exposed for Base cloning (ICL): name -> (type, fallback default, min, max). Defaults come from the
 # model's generation_config.json when it sets them. A None default means the option is derived per request when omitted.
 # Unlike mlx-audio, qwen-tts passes repetition_penalty through unchanged in ICL mode, so there is no 1.5 floor.
@@ -96,9 +97,9 @@ def settings():
 
 
 def replica_runtime_env():
-    """The TTS virtualenv's interpreter, plus the build environment's HF_* variables (e.g. HF_HUB_OFFLINE)."""
+    """The voice virtualenv's interpreter, plus the build environment's HF_* variables (e.g. HF_HUB_OFFLINE)."""
     env_vars = {name: value for name, value in os.environ.items() if name.startswith("HF_")}
-    runtime_env = {"py_executable": os.environ.get("TTS_PYTHON", "/home/ray/tts-venv/bin/python")}
+    runtime_env = {"py_executable": os.environ.get("TTS_PYTHON", "/home/ray/voice-venv/bin/python")}
     return {**runtime_env, "env_vars": env_vars} if env_vars else runtime_env
 
 

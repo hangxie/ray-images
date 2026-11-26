@@ -63,36 +63,41 @@ RUN pip install "brotli>=1.2" \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
-# Qwen3-TTS runs in its own virtualenv because qwen-tts pins transformers==4.57.3, which vLLM rules out. The venv
-# inherits the system packages (Ray, torch, CUDA libraries) and adds only what qwen-tts needs on top; torch/torchaudio
-# are constrained to the system versions so no second copy is installed. TTS replicas run its interpreter through
-# runtime_env py_executable (tts/app/serve_tts.py). Kept after the vLLM layers so a TTS change rebuilds only this.
+# Qwen3-TTS runs in its own virtualenv, /home/ray/voice-venv, because qwen-tts pins transformers==4.57.3, which vLLM
+# rules out. The venv inherits the system packages (Ray, torch, CUDA libraries) and adds only what qwen-tts needs on
+# top; torch/torchaudio are constrained to the system versions so no second copy is installed. TTS and STT replicas run
+# its interpreter through runtime_env py_executable. Kept after the vLLM layers so a TTS change rebuilds only this.
 # Silero VAD (torch only, model in the wheel) tells speech from music and noise for STT's live stream.
 ARG QWEN_TTS_VERSION=0.1.1
 ARG SILERO_VAD_VERSION=6.3
 LABEL io.github.hangxie.ray-images.qwen-tts-version="${QWEN_TTS_VERSION}" \
       io.github.hangxie.ray-images.silero-vad-version="${SILERO_VAD_VERSION}"
-COPY --chown=ray:users tts/check_requirements.py /tmp/check_requirements.py
-RUN python3 -m venv --system-site-packages /home/ray/tts-venv \
+COPY --chown=ray:users serve/check_requirements.py /tmp/check_requirements.py
+RUN python3 -m venv --system-site-packages /home/ray/voice-venv \
     && pip list --format=freeze | grep -E '^(torch|torchaudio)==' > /tmp/constraints.txt \
-    && /home/ray/tts-venv/bin/pip install --constraint /tmp/constraints.txt \
+    && /home/ray/voice-venv/bin/pip install --constraint /tmp/constraints.txt \
        "qwen-tts==${QWEN_TTS_VERSION}" "silero-vad==${SILERO_VAD_VERSION}" "scipy>=1.14.0" soundfile \
-    && /home/ray/tts-venv/bin/python /tmp/check_requirements.py "qwen-tts==${QWEN_TTS_VERSION}" \
+    && /home/ray/voice-venv/bin/python /tmp/check_requirements.py "qwen-tts==${QWEN_TTS_VERSION}" \
        "silero-vad==${SILERO_VAD_VERSION}" scipy soundfile \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
-# The Serve apps, importable as serve_tts:app, serve_stt:app, serve_chat:app and serve_meeting:app: the head builds
-# them with the system Python; TTS and STT replicas run in the venv, chat and meeting replicas in the system Python.
+# The Serve apps, one directory each under /home/ray/serve, all on PYTHONPATH so they stay importable as serve_tts:app,
+# serve_stt:app, serve_chat:app and serve_meeting:app: the head builds them with the system Python; TTS and STT replicas
+# run in the venv, chat and meeting replicas in the system Python.
 # pyarrow (from the base image, unused here) is blocked for the checks because its native library segfaults under
 # amd64 emulation on Apple Silicon; ray.serve and qwen_tts import fine without it.
-COPY --chown=ray:users tts/app/ /home/ray/tts/
-ENV PYTHONPATH=/home/ray/tts${PYTHONPATH:+:${PYTHONPATH}}
+COPY --chown=ray:users serve/tts/ /home/ray/serve/tts/
+COPY --chown=ray:users serve/stt/ /home/ray/serve/stt/
+COPY --chown=ray:users serve/chat/ /home/ray/serve/chat/
+COPY --chown=ray:users serve/meeting/ /home/ray/serve/meeting/
+ENV PYTHONPATH=/home/ray/serve/tts:/home/ray/serve/stt:/home/ray/serve/chat:/home/ray/serve/meeting${PYTHONPATH:+:${PYTHONPATH}}
 RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, serve_stt, serve_chat, serve_meeting, transformers; print('Serve apps:', serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app, 'system transformers', transformers.__version__)" \
-    && /home/ray/tts-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts, silero_vad; silero_vad.load_silero_vad(); assert transformers.__version__ == '4.57.3', transformers.__version__; print('TTS venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
+    && /home/ray/voice-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts, serve_stt, silero_vad; silero_vad.load_silero_vad(); assert transformers.__version__ == '4.57.3', transformers.__version__; print('Voice venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
 
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev
-# A file, not ENV: Podman's cache reuses an ENV layer when only VERSION changes, but reruns a RUN that uses it
-RUN printf '%s\n' "${VERSION}" > /home/ray/tts/VERSION
+# A file, not ENV: Podman's cache reuses an ENV layer when only VERSION changes, but reruns a RUN that uses it.
+# One file beside the app directories, read by every app.
+RUN printf '%s\n' "${VERSION}" > /home/ray/serve/VERSION
 LABEL org.opencontainers.image.version="${VERSION}"

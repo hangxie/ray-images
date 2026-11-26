@@ -1,5 +1,5 @@
 """The uv environment the tests run in matches the image: the Dockerfile's version ARGs, the transformers version its
-TTS venv check asserts, and the torch/torchaudio/fastapi versions vLLM pins in the system environment.
+venv check asserts, and the torch/torchaudio/fastapi versions vLLM pins in the system environment.
 
 vLLM's pins come from PyPI, so that test is marked `network` and runs only in `make pins`."""
 

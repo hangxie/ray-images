@@ -24,7 +24,8 @@ from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
 ROOT = Path(__file__).resolve().parent
-VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
+VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
 BACKEND_TIMEOUT = 10  # for opening STT's stream; the stream itself has no deadline
 # For STT's /health, which the page waits on while STT hasn't answered yet (e.g. while Whisper loads): the page then
 # loads without the language list instead of hanging.

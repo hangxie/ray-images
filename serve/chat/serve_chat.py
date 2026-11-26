@@ -33,7 +33,8 @@ from ray import serve
 from starlette.exceptions import HTTPException
 
 ROOT = Path(__file__).resolve().parent
-VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
+VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
+VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant in a spoken conversation. Reply in the language the user speaks. "
     "Keep answers brief, one to three short sentences, unless asked for more detail. "

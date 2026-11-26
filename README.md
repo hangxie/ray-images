@@ -7,8 +7,11 @@ The head, LLM workers, and TTS workers all run this one image, so the Ray versio
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py, stt.html; serve_chat.py, chat.html; serve_meeting.py, meeting.html), importable as serve_tts:app, serve_stt:app, serve_chat:app, serve_meeting:app
-tts/check_requirements.py   build-time dependency check for the TTS virtualenv
+serve/tts/                  TTS Serve app (serve_tts.py, cuda_graphs.py, index.html), importable as serve_tts:app
+serve/stt/                  STT Serve app (serve_stt.py, stt.html), importable as serve_stt:app
+serve/chat/                 voice chat Serve app (serve_chat.py, chat.html), importable as serve_chat:app
+serve/meeting/              meeting notes Serve app (serve_meeting.py, meeting.html), importable as serve_meeting:app
+serve/check_requirements.py build-time dependency check for the voice virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
 ```
@@ -26,7 +29,7 @@ Images up to `v0.3.0` were published as `hangxie/ray-vllm` and use the `io.githu
 
 ## Development
 
-`pyproject.toml` and `uv.lock` define a development environment for linting and tests only; the image is still built with pip from the `Dockerfile`. The environment mirrors the TTS virtualenv (Ray, the torch/torchaudio/fastapi versions vLLM pins, qwen-tts with transformers 4.57.3), so keep its pins in step with the `Dockerfile` when upgrading.
+`pyproject.toml` and `uv.lock` define a development environment for linting and tests only; the image is still built with pip from the `Dockerfile`. The environment mirrors the voice virtualenv (Ray, the torch/torchaudio/fastapi versions vLLM pins, qwen-tts with transformers 4.57.3), so keep its pins in step with the `Dockerfile` when upgrading.
 
 Most of the code needs a GPU, so the tests run what they can on CPU: the HTTP APIs and request validation against fake models, audio post-processing, and, with tiny random qwen-tts models, the generation hooks, CUDA-graph decoding bodies (eager on CPU) against HF `generate`, and streamed decoding against the full-clip decode. Model loading, CUDA graph capture, and real synthesis are still validated on the cluster. CI runs `make check` on every push and pull request.
 
@@ -79,13 +82,13 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 
 ### Python environments
 
-`qwen-tts==0.1.1` pins `transformers==4.57.3`, but vLLM 0.27.0 needs `transformers>=5.5.3`. TTS therefore gets its own virtualenv at `/home/ray/tts-venv`.
+`qwen-tts==0.1.1` pins `transformers==4.57.3`, but vLLM 0.27.0 needs `transformers>=5.5.3`. TTS therefore gets its own virtualenv at `/home/ray/voice-venv`, which STT shares (see [STT](#stt)).
 
 - The venv is created with `--system-site-packages`. It reuses the image's Ray, torch, torchaudio, and CUDA libraries, and adds only transformers 4.57.3 and qwen-tts's other dependencies (about 0.4 GB).
-- TTS replicas start with the venv's interpreter, through Ray's `runtime_env` `py_executable`.
+- TTS and STT replicas start with the venv's interpreter, through Ray's `runtime_env` `py_executable`.
 - Everything else, including the head that builds the app, uses the system Python.
 
-`pip check` passes for the system environment. Inside the venv it always reports vLLM's transformers requirement, so the build runs `tts/check_requirements.py` there instead. It checks every qwen-tts requirement as the venv resolves it.
+`pip check` passes for the system environment. Inside the venv it always reports vLLM's transformers requirement, so the build runs `serve/check_requirements.py` there instead. It checks every qwen-tts requirement as the venv resolves it.
 
 `gradio` is only used by the qwen-tts demo, but it stays installed because qwen-tts declares it.
 
@@ -94,7 +97,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 `GET /` (page), `GET /health`, `GET /voices`, and `POST /api/tts` keep the MLX service's fields, ranges, error codes, and headers, so its `index.html` and `txt2mp3.sh` work unchanged. Point `TTS_URL` at the new endpoint.
 
 - `X-Peak-CUDA-GB` replaces `X-Peak-MLX-GB`, and `/health` reports the CUDA device.
-- The page title and `/health` show the image tag from the `VERSION` file the build writes next to the app, as in [Voice chat](#voice-chat); STT's `/v1/health` reports it too.
+- The page title and `/health` show the image tag from the `VERSION` file the build writes beside the app directories, as in [Voice chat](#voice-chat); STT's `/v1/health` reports it too.
 - The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
 - The page retries a 503 the way it retried the old 409.
 - `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
@@ -106,10 +109,10 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 |---|---|---|
 | `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model ID reported by `/health`; loaded from the Hub if `TTS_MODEL_DIR` is unset |
 | `TTS_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
-| `TTS_VOICES_DIR` | `/home/ray/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
+| `TTS_VOICES_DIR` | `/home/ray/serve/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
 | `TTS_NUM_REPLICAS` | `2` | Replicas, one GPU each |
 | `TTS_MAX_QUEUED_REQUESTS` | `4` | Requests Serve queues before answering 503 |
-| `TTS_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for TTS replicas (`py_executable`) |
+| `TTS_PYTHON` | `/home/ray/voice-venv/bin/python` | Interpreter for TTS replicas (`py_executable`) |
 | `TTS_CUDA_GRAPHS` | `1` | `0` turns off CUDA-graph decoding (see [Decoding speed](#decoding-speed)) |
 | `TTS_KV_CACHE_TOKENS` | `3072` | Talker KV cache size for CUDA-graph decoding, in codec tokens including the prompt |
 | `TTS_STREAM_CONTEXT_FRAMES` | `300` | Frames of reference plus speech the decoder transformer sees per streamed piece |
@@ -131,7 +134,7 @@ Each replica asks for `num_gpus: 1` plus a custom `tts: 1` resource and handles 
 
 Each audio frame (80 ms) takes one talker step plus 15 code-predictor steps, all small batch-1 forward passes. In eager HF `generate`, Python and kernel-launch overhead dominate: on an RTX 3050 the replica held one CPU core at 100% with the GPU about 22% busy, for an RTF around 4.
 
-With `TTS_CUDA_GRAPHS=1` (the default), `tts/app/cuda_graphs.py` replays both as CUDA graphs:
+With `TTS_CUDA_GRAPHS=1` (the default), `serve/tts/cuda_graphs.py` replays both as CUDA graphs:
 
 - The code predictor's whole per-frame decode (prefill, 14 steps, and sampling) is one graph replay.
 - The talker's one-token step is one graph over a static KV cache of `TTS_KV_CACHE_TOKENS` slots. HF `generate` still drives the talker loop, so the end-of-speech and disconnect hooks run once per frame outside the graph.
@@ -166,7 +169,7 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 ## STT
 
-`serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
+`serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the voice virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
 
 The routes carry `/v1` themselves, as `mlx-stt-svc`'s do, so mount it at `route_prefix: /` on its own host (or at any prefix, such as `/stt`): `GET /` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers.
 
@@ -190,7 +193,7 @@ The routes carry `/v1` themselves, as `mlx-stt-svc`'s do, so mount it at `route_
 | `STT_NUM_REPLICAS` | `1` | Replicas, one GPU each |
 | `STT_MAX_ONGOING_REQUESTS` | `16` | Requests and streams a replica takes at once; transcription itself runs one at a time |
 | `STT_MAX_QUEUED_REQUESTS` | `8` | Requests Serve queues before answering 503 |
-| `STT_PYTHON` | `/home/ray/tts-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |
+| `STT_PYTHON` | `/home/ray/voice-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |
 
 ## Voice chat
 
@@ -203,7 +206,7 @@ Mount it at its own route prefix, for example `route_prefix: /chat`, and open th
 - A turn is one streamed request that mostly waits on the backends, so a replica takes up to `CHAT_MAX_ONGOING_REQUESTS` turns at once instead of TTS's one.
 - A client that disconnects cancels its turn: the replica shuts its in-flight STT, LLM, and TTS connections, so TTS stops synthesizing at the next frame.
 - Backend connections are kept alive and shared by a replica's turns, so STT calls and TTS sentences skip the TCP and TLS handshakes; through the homelab's HTTPS Gateway the handshake was ~28 of the ~33 ms each call cost. A connection is reused only after its response was read to the end, a pooled one the server has closed is replaced on the next request, and an interrupted turn's connections are closed, not pooled. The streamed LLM reply's connection is closed after `[DONE]`, since it is one call per turn.
-- The page header and `/health` show the image tag, which the build writes to `VERSION` next to the app; it reads `dev` outside the image. TTS and STT report it the same way.
+- The page header and `/health` show the image tag, which the build writes to `serve/VERSION`, shared by all the apps; it reads `dev` outside the image. TTS and STT report it the same way.
 - There is no client-IP allowlist, unlike on `media`; access control belongs to the deployment in front, as for TTS and STT. The `CHAT_*_TOKEN`s are only what the replica sends to its backends, for example a PAT when TTS sits behind the Gateway's bearer check.
 
 | Setting | Default | Effect |

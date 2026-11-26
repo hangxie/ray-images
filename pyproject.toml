@@ -1,6 +1,6 @@
 # Development environment for linting and CPU tests (`make setup`). The image itself is built by the Dockerfile with
-# pip; this mirrors the TTS virtualenv (system Ray + torch, qwen-tts's transformers 4.57.3) closely enough to import and
-# exercise the Serve apps and the CUDA-graph bodies on CPU.
+# pip; this mirrors the voice virtualenv (system Ray + torch, qwen-tts's transformers 4.57.3) closely enough to import
+# and exercise the Serve apps and the CUDA-graph bodies on CPU.
 [project]
 name = "ray-images"
 version = "0"
@@ -43,7 +43,7 @@ explicit = true
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["tts/app", "tts", "scripts"]
+src = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RUF"]
@@ -51,8 +51,8 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RUF"]
 [tool.mypy]
 python_version = "3.12"
 check_untyped_defs = true
-files = ["tts", "scripts", "tests"]
-mypy_path = ["tts/app", "tts", "scripts", "tests"]
+files = ["serve", "scripts", "tests"]
+mypy_path = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts", "tests"]
 explicit_package_bases = true
 
 # No type information; flashinfer_jit_cache only exists in the image
@@ -62,7 +62,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["tts/app", "tts", "scripts"]
+pythonpath = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
 addopts = ["-ra", "--strict-markers", "-m", "not network"]
 markers = ["network: reads PyPI; run by `make pins`, not `make test`"]
 filterwarnings = [
