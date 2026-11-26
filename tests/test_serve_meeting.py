@@ -139,6 +139,24 @@ def test_page_loads_while_stt_is_down():
     assert meeting.languages is None  # asked again on the next page
 
 
+def test_page_does_not_wait_long_for_a_hanging_stt(monkeypatch):
+    # serve.ingress copies the class by value, globals included, so patch the copy's rather than the module's
+    replica_globals = cast(Any, serve_meeting.Meeting).func_or_class.stt_health.__globals__
+    monkeypatch.setitem(replica_globals, "HEALTH_TIMEOUT", 0.2)
+    with socket.socket() as hanging:  # takes connections (into its backlog) and never answers
+        hanging.bind(("127.0.0.1", 0))
+        hanging.listen()
+        client = serve_client(serve_meeting, make_replica(f"http://127.0.0.1:{hanging.getsockname()[1]}/v1"))
+        try:
+            started = time.perf_counter()
+            response = client.get("/")
+            elapsed = time.perf_counter() - started
+        finally:
+            serve_meeting.api.dependency_overrides.clear()
+    assert response.status_code == 200 and page_languages(response.text) == {}
+    assert elapsed < 1.5
+
+
 def test_health(client, stt):
     assert client.get("/health").json() == {"status": "ok", "version": serve_meeting.VERSION, "stt": stt.url}
 

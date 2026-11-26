@@ -28,19 +28,20 @@ const RATE = 16000, MAX_SECONDS = 290;  // the service takes up to 300 s per upl
 let ctx, frames = null;
 
 async function start() {
-  if (!ctx) {
-    ctx = new AudioContext();
+  if (!ctx) {  // set up once; ctx is kept only when the microphone is ready, so a refusal can be retried
+    const audio = new AudioContext();
     const media = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
     const worklet = `registerProcessor('rec', class extends AudioWorkletProcessor {
       process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } });`;
-    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
-    const recorder = new AudioWorkletNode(ctx, 'rec');
+    await audio.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
+    const recorder = new AudioWorkletNode(audio, 'rec');
     recorder.port.onmessage = e => {
       if (!frames) return;
       frames.push(e.data);
-      if (frames.length * e.data.length >= ctx.sampleRate * MAX_SECONDS) stop();
+      if (frames.length * e.data.length >= audio.sampleRate * MAX_SECONDS) stop();
     };
-    ctx.createMediaStreamSource(media).connect(recorder);
+    audio.createMediaStreamSource(media).connect(recorder);
+    ctx = audio;
   }
   await ctx.resume();
   frames = [];
@@ -82,6 +83,7 @@ async function stop() {
   frames = null;
   $('record').textContent = 'Record';
   $('record').classList.remove('on');
+  if (recorded.reduce((n, f) => n + f.length, 0) < ctx.sampleRate * 0.3) { $('status').textContent = 'Too short'; return; }
   $('status').textContent = 'Transcribing…';
   const form = new FormData();
   form.append('file', wav(recorded, ctx.sampleRate), 'speech.wav');

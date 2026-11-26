@@ -10,7 +10,7 @@ const element = id => elements[id] ??= {
   append(...c) { this.children.push(...c); }, scrollIntoView() {},
 };
 const document = {getElementById: element, createElement: () => element(`_${Object.keys(elements).length}`)};
-let port, uploads = [], answer = {status: 200, body: {text: 'Hello world.', language: 'english', duration: 1.0}};
+let port, refuse = true, uploads = [], answer = {status: 200, body: {text: 'Hello world.', language: 'english', duration: 1.0}};
 const context = {
   document, console,
   URL: {createObjectURL: () => 'blob:worklet'},
@@ -22,7 +22,7 @@ const context = {
     async resume() {}
   },
   AudioWorkletNode: class { constructor() { port = this.port = {}; } },
-  navigator: {mediaDevices: {getUserMedia: async () => ({})}},
+  navigator: {mediaDevices: {getUserMedia: async () => { if (refuse) { refuse = false; throw new Error('denied'); } return {}; }}},
   fetch: async (url, init) => {
     uploads.push({url, form: init.body});
     return {ok: answer.status === 200, status: answer.status, statusText: 'error', json: async () => answer.body};
@@ -41,7 +41,10 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
 (async () => {
   await $('record').onclick();
-  check($('record').textContent === 'Stop' && $('record').classList.set.has('on'), 'Record starts recording');
+  check($('status').textContent === 'Microphone unavailable: denied' && !$('record').classList.set.has('on'),
+    'a refused microphone is reported');
+  await $('record').onclick();
+  check($('record').textContent === 'Stop' && $('record').classList.set.has('on'), 'Record retries and starts recording');
   for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128).fill(0.5)});  // 1 s at 48 kHz
   await $('record').onclick();
   await settle();
@@ -54,9 +57,14 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 0));
   check($('log').children.at(-1).textContent === 'Hello world.' && /english/.test($('status').textContent),
     'the text is shown');
 
-  answer = {status: 503, body: {error: {message: 'busy'}}};
   await $('record').onclick();
   port.onmessage({data: new Float32Array(128)});
+  await $('record').onclick();
+  check(uploads.length === 1 && $('status').textContent === 'Too short', 'a too-short recording is not uploaded');
+
+  answer = {status: 503, body: {error: {message: 'busy'}}};
+  await $('record').onclick();
+  for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128)});
   await $('record').onclick();
   await settle();
   const last = $('log').children.at(-1);

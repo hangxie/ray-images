@@ -25,7 +25,10 @@ from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
 ROOT = Path(__file__).resolve().parent
 VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
-BACKEND_TIMEOUT = 10  # for STT's /health and for opening its stream; the stream itself has no deadline
+BACKEND_TIMEOUT = 10  # for opening STT's stream; the stream itself has no deadline
+# For STT's /health, which the page waits on while STT hasn't answered yet (e.g. while Whisper loads): the page then
+# loads without the language list instead of hanging.
+HEALTH_TIMEOUT = 2
 MAX_EVENT_BYTES = 1024 * 1024  # STT's events are small JSON objects
 
 logger = logging.getLogger("ray.serve")
@@ -88,7 +91,7 @@ class Meeting:
 
     def stt_health(self):
         request = urllib.request.Request(f"{self.config['stt_url']}/health", headers=auth(self.config["stt_token"]))
-        with urllib.request.urlopen(request, timeout=BACKEND_TIMEOUT) as response:
+        with urllib.request.urlopen(request, timeout=HEALTH_TIMEOUT) as response:
             return json.loads(response.read())
 
     def stt_languages(self):
