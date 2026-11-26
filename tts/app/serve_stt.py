@@ -1,13 +1,15 @@
 """Ray Serve speech-to-text service: Whisper (transformers / PyTorch on CUDA) behind OpenAI's transcription API.
 
-Port of site-up's ai/mlx-stt-svc with the same HTTP surface under the application's route prefix (/v1). It runs in the
-TTS virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and scipy, so the
-image needs no packages for it. As in serve_tts, module-level imports are limited to what both environments have.
+Port of site-up's ai/mlx-stt-svc with the same HTTP surface under the application's route prefix (/v1), plus a
+recording page at `GET /` (stt.html). It runs in the TTS virtualenv beside serve_tts, which already has transformers
+(4.57.3, with Whisper), soundfile and scipy, so the image needs no packages for it. As in serve_tts, module-level
+imports are limited to what both environments have.
 """
 
 import asyncio
 import email.parser
 import email.policy
+import html
 import io
 import logging
 import os
@@ -119,6 +121,11 @@ class STT:
         # Warm up so the first real request does not pay for CUDA kernel selection.
         self.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), None)
         logger.info("STT ready; %.2f GB CUDA allocated", torch.cuda.memory_allocated() / 1e9)
+
+    @api.get("/")
+    def page(self):
+        page = (ROOT / "stt.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
+        return reply(200, page.encode(), "text/html; charset=utf-8")
 
     @api.get("/health")
     def health(self):
