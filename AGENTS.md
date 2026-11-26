@@ -62,6 +62,7 @@ podman push localhost/hangxie/ray-images:<tag> docker.io/hangxie/ray-images:<tag
 - Generation runs under `torch.no_grad()`, as `generate_voice_clone` does; inference mode would make the static caches inference tensors.
 - HTTP tests drive the real FastAPI routes with a hand-built replica (`object.__new__` on the deployment's class) by overriding Serve's `get_current_servable_instance` dependency; only the model is faked.
 - `tests/test_head.py` imports both apps with the replica-only packages blocked, and pickles the app and replica class, as the head does.
+- `tests/test_stt_page.py` runs `stt.html`'s script, as `GET /` serves it, in node against fake browser APIs (`tests/stt_page.js`): the language menu, and a meeting from the first audio frame to `done`. It skips without node; extend it when the page changes.
 - Not covered on CPU: `TTS.__init__`/`STT.__init__` (real checkpoints on `cuda:0`), `STT.transcribe`, `warm_up`, and CUDA graph capture/replay itself. Those still need the cluster.
 
 ## Gotchas

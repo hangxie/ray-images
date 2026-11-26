@@ -136,15 +136,15 @@ $('language-other').oninput = saveLanguage;
 
 async function start() {
   ctx = ctx || new AudioContext();
-  const stream = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
+  const media = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1}});
   const worklet = `registerProcessor('rec', class extends AudioWorkletProcessor {
     process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } });`;
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
-  mic = ctx.createMediaStreamSource(stream);
+  mic = ctx.createMediaStreamSource(media);
   recorder = new AudioWorkletNode(ctx, 'rec');
   recorder.port.onmessage = e => {
     const rms = level(e.data);
-    if (meeting) stream(e.data);
+    if (meeting) queueFrame(e.data);
     if (recording) record(e.data);
     if (handsFree) detect(e.data, rms);
     // In a meeting the server decides what is speech, so the bar shows only the level.
@@ -356,7 +356,7 @@ async function startMeeting() {
 }
 
 // Frames are sent about every 0.1 s as 16 kHz 16-bit PCM; they wait here until the socket opens.
-function stream(frame) {
+function queueFrame(frame) {
   if (meeting.stopping) return;
   meeting.at ??= Date.now() - frame.length / ctx.sampleRate * 1000;
   meeting.frames.push(frame); meeting.length += frame.length;
