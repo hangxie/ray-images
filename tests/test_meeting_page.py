@@ -1,4 +1,4 @@
-"""stt.html's script, as `GET /` serves it, run in node against fake browser APIs (tests/stt_page.js)."""
+"""meeting.html's script, as `GET /` serves it, run in node against fake browser APIs (tests/meeting_page.js)."""
 
 import re
 import shutil
@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from test_serve_stt import client, replica  # noqa: F401  # fixtures
+from test_serve_meeting import client, replica, stt  # noqa: F401  # fixtures
 
 NODE = shutil.which("node")
 
@@ -16,8 +16,8 @@ def test_page_script(client, tmp_path):  # noqa: F811
     page = client.get("/").text
     found = re.search(r"<script>(.*)</script>", page, re.S)
     assert found
-    script = tmp_path / "stt.js"
+    script = tmp_path / "meeting.js"
     script.write_text(found.group(1))
-    harness = Path(__file__).with_name("stt_page.js")
+    harness = Path(__file__).with_name("meeting_page.js")
     result = subprocess.run([str(NODE), str(harness), str(script)], capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr

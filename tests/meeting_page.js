@@ -1,5 +1,5 @@
-// Runs stt.html's script against fake browser APIs (DOM, Web Audio, WebSocket, storage): the language picker, and a
-// meeting from the first audio frame to `done`. Usage: node stt_page.js <script.js>; exits 1 on a failed check.
+// Runs meeting.html's script against fake browser APIs (DOM, Web Audio, WebSocket, storage): the language picker, and
+// a meeting from the first audio frame to `done`. Usage: node meeting_page.js <script.js>; exits 1 on a failed check.
 const fs = require('fs');
 const vm = require('vm');
 
@@ -49,7 +49,7 @@ const context = {
     resume() {}
   },
   AudioWorkletNode: class { constructor() { port = this.port = {}; } },
-  location: {href: 'https://stt.example/v1/', protocol: 'https:'},
+  location: {href: 'https://apps.example/meeting/', protocol: 'https:'},
   localStorage: {getItem: k => storage[k] ?? null, setItem: (k, v) => { storage[k] = v; }},
   navigator: {mediaDevices: {getUserMedia: async () => ({})}},
   confirm: () => true,
@@ -77,7 +77,8 @@ const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)
 
   await $('meeting').onclick();
   const socket = sockets[0];
-  check(socket?.url === 'wss://stt.example/v1/audio/stream?language=chinese', `stream URL ${socket?.url}`);
+  check(socket?.url === 'wss://apps.example/meeting/api/stream?language=chinese', `stream URL ${socket?.url}`);
+  check($('meeting').textContent === 'Stop meeting' && $('meter').classList.set.has('on'), 'the button stops the meeting');
   const frame = new Float32Array(128).fill(0.1);  // what the worklet posts, at 48 kHz
   for (let i = 0; i < 40; i++) port.onmessage({data: frame});
   check(socket.sent.length === 0, 'audio waits for the socket to open');
@@ -113,7 +114,7 @@ const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)
   $('meeting').onclick();
   check(JSON.parse(socket.sent.at(-1)).type === 'stop' && $('meeting').disabled, 'Stop sends stop and waits');
   deliver(socket, {type: 'done'});
-  check(!$('meeting').disabled && $('meeting').textContent === 'Meeting: off', 'done ends the meeting');
+  check(!$('meeting').disabled && $('meeting').textContent === 'Start meeting', 'done ends the meeting');
   port.onmessage({data: frame});  // the microphone keeps running after the meeting
   check(socket.sent.length === pcm.length + 2, 'nothing is sent after the meeting');
   process.exit(failed ? 1 : 0);

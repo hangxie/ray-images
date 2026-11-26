@@ -11,6 +11,7 @@ import pytest
 from ray import cloudpickle
 
 import serve_chat
+import serve_meeting
 import serve_stt
 import serve_tts
 
@@ -39,9 +40,9 @@ class Head:
 
 
 sys.meta_path.insert(0, Head())
-import serve_chat, serve_stt, serve_tts
+import serve_chat, serve_meeting, serve_stt, serve_tts
 
-print(serve_tts.app, serve_stt.app, serve_chat.app)
+print(serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app)
 """
 
 
@@ -52,7 +53,7 @@ def test_apps_import_without_replica_packages():
     assert result.returncode == 0, result.stderr
 
 
-@pytest.mark.parametrize("module", [serve_tts, serve_stt, serve_chat])
+@pytest.mark.parametrize("module", [serve_tts, serve_stt, serve_chat, serve_meeting])
 def test_app_pickles(module):
     """Serve pickles the ingress app and the replica class, so nothing unpicklable (e.g. threading.local) may live at
     module level. The ingress wrapper is a dynamic subclass, so it goes by value with the globals its methods use."""
@@ -141,8 +142,17 @@ def test_chat_deployment_options():
     assert deployment.max_ongoing_requests == 16  # each open turn is one ongoing request
 
 
+def test_meeting_deployment_options():
+    """Meeting notes holds no model either: a page change must not need a GPU replica."""
+    deployment = cast(Any, serve_meeting.Meeting)
+    assert not deployment.ray_actor_options.get("num_gpus")
+    assert "runtime_env" not in deployment.ray_actor_options
+    assert deployment.max_ongoing_requests == 16  # each open meeting is one ongoing request
+
+
 def test_apps_bind_head_settings():
     """Settings reach replicas only as bind() arguments."""
     assert serve_tts.app._bound_deployment.init_args == (serve_tts.settings(),)
     assert serve_stt.app._bound_deployment.init_args == (serve_stt.settings(),)
     assert serve_chat.app._bound_deployment.init_args == (serve_chat.settings(),)
+    assert serve_meeting.app._bound_deployment.init_args == (serve_meeting.settings(),)

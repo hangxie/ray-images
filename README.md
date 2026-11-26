@@ -1,13 +1,13 @@
 # ray-images
 
-Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)), a Whisper speech-to-text Ray Serve app (see [STT](#stt)), and a voice chat app that drives them and an LLM (see [Voice chat](#voice-chat)).
+Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)), a Whisper speech-to-text Ray Serve app (see [STT](#stt)), a voice chat app that drives them and an LLM (see [Voice chat](#voice-chat)), and a meeting notes app that transcribes a meeting live through STT (see [Meeting notes](#meeting-notes)).
 
 The head, LLM workers, and TTS workers all run this one image, so the Ray version and the Serve app code always match across the cluster.
 
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py, stt.html; serve_chat.py, chat.html), importable as serve_tts:app, serve_stt:app, serve_chat:app
+tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py; serve_chat.py, chat.html; serve_meeting.py, meeting.html), importable as serve_tts:app, serve_stt:app, serve_chat:app, serve_meeting:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
@@ -168,10 +168,7 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 `serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
 
-Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`.
-
-- The page records speech and appends each utterance's transcript to a running transcript, which it keeps in the browser's local storage and can copy, download as text with a clock time per paragraph, or download as WebVTT subtitles with one cue per piece. It stays until New note clears it, so a reload keeps it; a meeting that is running carries on into the new note. Hold the button (or Space) to talk, or turn on hands-free, which starts and stops on speech with the voice chat page's voice activity detection and keeps listening until turned off; a hands-free utterance is cut every 30 s so long speech is transcribed as it goes. Utterances are sent one at a time, in order, while recording continues. The language menu offers auto-detect and six common languages; Other… takes any language Whisper knows, by name or code, with suggestions from the server's own list, and marks anything else instead of sending it. The header shows the image version, as on the other pages. It uses relative URLs, so open it with the trailing slash (`/v1/`).
-- Meeting mode, for one long recording such as a meeting, streams the microphone to `audio/stream` instead of uploading utterances, and text appears while people keep talking: the piece being spoken shows in grey and is updated about every second, then replaced by its final text when the piece ends. Pieces join into a paragraph until a pause of 2 s or more. The connection is one Serve request for the whole meeting, so nothing queues in the browser; if it drops, recording stops and the transcript so far is kept. A proxy in front must pass WebSocket upgrades.
+Mount it at `route_prefix: /v1`: `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers. STT has no page of its own: the recording page moved to the meeting notes app, so a page change no longer redeploys the GPU replica and reloads Whisper.
 
 `audio/stream` takes 16 kHz mono 16-bit little-endian PCM as binary messages, then `{"type": "stop"}`, with an optional `language` query parameter. It answers with a `segment` event (`start`, `end` in seconds from the first sample, `text`, `language`, `paragraph`, `seconds` spent transcribing) for each piece with text, `error` for a piece that failed (the stream goes on), and `done` after the last piece. While a piece is still going, a `partial` event (`start`, `text`) previews its text about every second of audio, when the GPU is free and no finished piece is waiting; the piece's `segment` has the same `start`, and no partial for a piece comes after it. Previews re-transcribe the piece from its start, so a 15 s piece costs up to 15 extra transcriptions of growing length; on the cluster a 7 s piece took 0.5–0.7 s, so one meeting keeps the GPU about half busy, and finished pieces and HTTP requests go first.
 
@@ -221,3 +218,26 @@ Mount it at its own route prefix, for example `route_prefix: /chat`, and open th
 | `CHAT_MAX_ONGOING_REQUESTS` | `16` | Turns (and page requests) a replica serves at once |
 
 As for TTS, set these in the application's `runtime_env` `env_vars`; they are read on the head and passed to the replicas through `Chat.bind()`.
+
+## Meeting notes
+
+`serve_meeting:app` transcribes one long recording, such as a meeting, while people keep talking. It is a product on top of STT rather than part of it, so its page and the features planned for it (saved transcripts, summaries, speaker names) change without touching the GPU replica; see [#26](https://github.com/hangxie/ray-images/issues/26).
+
+Mount it at its own route prefix, for example `route_prefix: /meeting`, and open the page with a trailing slash (`/meeting/`), since it uses relative URLs: `GET /` (page), `GET /health`, `WS /api/stream`.
+
+- The page streams the microphone to `api/stream` as 16 kHz PCM. The replica opens STT's `audio/stream` with `MEETING_STT_TOKEN` and relays messages both ways unchanged, so the events are STT's (see [STT](#stt)); when either side closes, the other is closed too, with STT's close code and reason passed to the page. Segmenting, prompts, and previews stay in STT, which needs the same audio and GPU for them.
+- Text appears as it is spoken: the piece being spoken shows in grey and is updated about every second, then replaced by its final text when the piece ends. Pieces join into a paragraph until a pause of 2 s or more. The meeting is one WebSocket for its whole length, so nothing queues in the browser; if it drops, recording stops and the transcript so far is kept. Proxies in front of both apps must pass WebSocket upgrades.
+- The transcript is kept in the browser's local storage and can be copied, downloaded as text with a clock time per paragraph, or downloaded as WebVTT subtitles with one cue per piece. It stays until New note clears it, so a reload keeps it; a meeting that is running carries on into the new note.
+- The language menu offers auto-detect and six common languages; Other… takes any language Whisper knows, by name or code, with suggestions from STT's `/health`. The replica reads that list once STT answers; until then the page still loads, and Other… falls back to auto-detect.
+- Only meeting mode moved here. STT's old page also had push-to-talk and hands-free modes, which uploaded single utterances to `audio/transcriptions`; voice chat covers short speech.
+- Like voice chat, it holds no models, so a replica asks for one CPU and no GPU and runs in the system Python. The relay uses the `websockets` client that Ray Serve already installs (through `uvicorn[standard]`).
+- Access control belongs to the deployment in front (in the homelab, OAuth2 Proxy for the page). `MEETING_STT_TOKEN` is only what the replica sends to STT.
+
+| Setting | Default | Effect |
+|---|---|---|
+| `MEETING_STT_URL` | `http://localhost:8000/v1` | Base URL of this image's STT (`/health`, `/audio/stream`); `ws://` or `wss://` follows from `http://` or `https://` |
+| `MEETING_STT_TOKEN` | unset | Sent to STT as `Authorization: Bearer <token>` |
+| `MEETING_NUM_REPLICAS` | `1` | Replicas |
+| `MEETING_MAX_ONGOING_REQUESTS` | `16` | Meetings (and page requests) a replica serves at once |
+
+As for chat, set these in the application's `runtime_env` `env_vars`; they are read on the head and passed to the replicas through `Meeting.bind()`.

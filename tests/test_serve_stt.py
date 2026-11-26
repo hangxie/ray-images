@@ -52,7 +52,9 @@ def test_health_and_models(client):
         "version": serve_stt.VERSION,
         "model": "openai/whisper-tiny",
         "device": "CPU / CUDA none",
+        "languages": TO_LANGUAGE_CODE,  # for serve_meeting's language menu
     }
+    assert TO_LANGUAGE_CODE["mandarin"] == "zh"
     assert client.get("/models").json() == {
         "object": "list",
         "data": [{"id": "openai/whisper-tiny", "object": "model", "owned_by": "local"}],
@@ -175,28 +177,9 @@ def test_multipart_fields_keeps_binary_payload():
     assert fields == {"file": payload, "language": b"en"}
 
 
-def test_page_uses_relative_urls(client):
-    response = client.get("/")
-    assert response.status_code == 200
-    assert response.headers["content-type"] == "text/html; charset=utf-8"
-    assert response.headers["cache-control"] == "no-store"
-    assert "fetch('audio/transcriptions'" in response.text
-    assert "new URL('audio/stream', location.href)" in response.text
-    assert "fetch('/" not in response.text  # absolute URLs would miss the /v1 route prefix
-    assert f'<span id="version">{serve_stt.VERSION}</span>' in response.text
-
-
-def test_page_language_picker_knows_whispers_languages(client):
-    import re
-
-    page = client.get("/").text
-    found = re.search(r"const LANGUAGE_CODES = (\{.*?\});", page)
-    assert found
-    codes = json.loads(found.group(1))
-    assert codes == TO_LANGUAGE_CODE and codes["mandarin"] == "zh"
-    presets = re.findall(r'<option value="([a-z]+)">', page)
-    assert presets == ["english", "chinese", "spanish", "french", "korean", "japanese", "other"]
-    assert all(p in codes for p in presets[:-1])  # each preset is a name the server accepts
+def test_no_page(client):
+    """The meeting page is serve_meeting's, so a page change doesn't reload Whisper."""
+    assert client.get("/").status_code == 404
 
 
 FRAME = serve_stt.Segmenter.FRAME / 16000  # seconds
