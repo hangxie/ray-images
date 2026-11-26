@@ -45,15 +45,14 @@
 <script>
 const $ = id => document.getElementById(id);
 const TARGET_RATE = 16000;
-const MAX_SECONDS = 290;  // the service takes up to 300 s per upload
-let ctx, mic, recorder, frames = [], recording = false, startedAt = null;
-// Hands-free voice activity detection, as on the voice chat page; durations in seconds. Speech starts when the
-// level stays above a multiple of the adaptive noise floor for `onset` and ends after `hangover` of quiet.
-// An utterance longer than `maxUtterance` is cut there and recording carries on into the next one.
+// Voice activity detection, as on the voice chat page; durations in seconds. In hands-free mode speech starts when the
+// level stays above a multiple of the adaptive noise floor for `onset` and ends after `hangover` of quiet. In both
+// modes a recording is sent in pieces so text appears while someone keeps talking: past `soft` seconds a `pause` of
+// quiet ends the piece, and `hard` ends it regardless; recording carries on into the next piece.
 const VAD = {preroll: 0.3, onset: 0.15, ratio: 3, keepRatio: 2, minLevel: 0.01, hangover: 0.8, minSpeech: 0.3,
-  maxUtterance: 30, floorUp: 3, floorDown: 0.3};
+  soft: 5, pause: 0.25, hard: 15, floorUp: 3, floorDown: 0.3};
 let handsFree = false, wakeLock = null;
-const vad = {floor: 0.005, above: 0, silence: 0, voiced: 0, length: 0, ring: [], ringLength: 0, auto: false, meterAt: 0, peak: 0};
+const vad = {floor: 0.005, continued: false, above: 0, silence: 0, voiced: 0, length: 0, ring: [], ringLength: 0, auto: false, meterAt: 0, peak: 0};
 // Utterances are transcribed one at a time, in order, while recording goes on.
 let queue = Promise.resolve(), pending = 0;
 // The transcript survives a reload: [{at, text, meta}].
@@ -91,59 +90,60 @@ async function start() {
   await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
   mic = ctx.createMediaStreamSource(stream);
   recorder = new AudioWorkletNode(ctx, 'rec');
-  recorder.port.onmessage = e => { if (recording) record(e.data); if (handsFree) detect(e.data); };
+  recorder.port.onmessage = e => listen(e.data);
   mic.connect(recorder);
   $('talk').textContent = 'Hold to talk (or hold Space)';
+  $('meter').classList.add('on');
 }
 
-function record(frame) {
-  frames.push(frame);
-  if (!vad.auto && frames.reduce((n, f) => n + f.length, 0) >= ctx.sampleRate * MAX_SECONDS) {
-    endUtterance(true, '');
-    beginUtterance([]);  // push-to-talk still held: keep recording into the next utterance
-  }
-}
-
-function detect(frame) {
+function listen(frame) {
   const dt = frame.length / ctx.sampleRate;
   let sum = 0;
   for (const s of frame) sum += s * s;
   const rms = Math.sqrt(sum / frame.length);
-  const threshold = Math.max(VAD.minLevel, vad.floor * VAD.ratio);
   if (!recording) {
-    // Keep the last `preroll` of audio so the first syllable before the trigger is not lost.
-    vad.ring.push(frame); vad.ringLength += dt;
-    while (vad.ringLength - vad.ring[0].length / ctx.sampleRate > VAD.preroll) vad.ringLength -= vad.ring.shift().length / ctx.sampleRate;
-    if (rms > threshold) vad.above += dt;
-    else {
-      vad.above = 0;
-      // The floor follows quiet quickly and rises slowly, so speech does not drag it up.
+    // The floor follows quiet quickly and rises slowly, so speech does not drag it up.
+    if (rms <= Math.max(VAD.minLevel, vad.floor * VAD.ratio)) {
       vad.floor += (rms - vad.floor) * Math.min(1, dt / (rms < vad.floor ? VAD.floorDown : VAD.floorUp));
       vad.floor = Math.max(vad.floor, 0.001);
     }
-    if (vad.above >= VAD.onset) {
-      const voiced = vad.above;
-      beginUtterance(vad.ring);
-      Object.assign(vad, {auto: true, silence: 0, voiced, length: voiced});
-    }
-  } else if (vad.auto) {
+    if (handsFree) detect(frame, rms, dt);
+  } else {
+    frames.push(frame);
     const keep = Math.max(VAD.minLevel * 0.6, vad.floor * VAD.keepRatio);
     if (rms > keep) { vad.silence = 0; vad.voiced += dt; } else vad.silence += dt;
     vad.length += dt;
-    if (vad.silence >= VAD.hangover) endUtterance(vad.voiced >= VAD.minSpeech, '');
-    else if (vad.length >= VAD.maxUtterance) {
-      endUtterance(true, '');
+    if (vad.auto && vad.silence >= VAD.hangover) endUtterance(vad.voiced >= VAD.minSpeech, '');
+    else if ((vad.length >= VAD.soft && vad.silence >= VAD.pause) || vad.length >= VAD.hard) {
+      const auto = vad.auto;
+      endUtterance(vad.voiced >= VAD.minSpeech, '');
       beginUtterance([]);
-      Object.assign(vad, {auto: true, silence: 0, voiced: 0, length: 0});
+      Object.assign(vad, {auto, continued: true});
     }
   }
+  meter(rms);
+}
+
+// Hands-free onset: keep the last `preroll` of audio so the first syllable before the trigger is not lost.
+function detect(frame, rms, dt) {
+  vad.ring.push(frame); vad.ringLength += dt;
+  while (vad.ringLength - vad.ring[0].length / ctx.sampleRate > VAD.preroll) vad.ringLength -= vad.ring.shift().length / ctx.sampleRate;
+  vad.above = rms > Math.max(VAD.minLevel, vad.floor * VAD.ratio) ? vad.above + dt : 0;
+  if (vad.above >= VAD.onset) {
+    const voiced = vad.above;
+    beginUtterance(vad.ring);
+    Object.assign(vad, {auto: true, voiced, length: voiced});
+  }
+}
+
+function meter(rms) {
   vad.peak = Math.max(vad.peak, rms);
   if (ctx.currentTime - vad.meterAt > 0.05) {
     vad.meterAt = ctx.currentTime;
     // -60 dBFS to -10 dBFS spans the bar.
     const db = 20 * Math.log10(vad.peak + 1e-9);
     $('level').style.width = `${Math.max(0, Math.min(100, (db + 60) * 2))}%`;
-    $('level').classList.toggle('speech', recording && vad.auto);
+    $('level').classList.toggle('speech', recording);
     vad.peak = 0;
   }
 }
@@ -160,7 +160,6 @@ async function toggleHandsFree() {
   handsFree = !handsFree;
   $('handsfree').textContent = `Hands-free: ${handsFree ? 'on' : 'off'}`;
   $('handsfree').classList.toggle('on', handsFree);
-  $('meter').classList.toggle('on', handsFree);
   Object.assign(vad, {above: 0, ring: [], ringLength: 0});
   if (handsFree) keepAwake();
   else {
@@ -203,7 +202,7 @@ async function pressTalk() {
 
 function beginUtterance(preroll) {
   frames = preroll.slice(); recording = true; startedAt = Date.now();
-  Object.assign(vad, {auto: false, ring: [], ringLength: 0, above: 0});
+  Object.assign(vad, {auto: false, continued: false, ring: [], ringLength: 0, above: 0, silence: 0, voiced: 0, length: 0});
   $('talk').classList.add('recording');
   status('Listening…');
 }
@@ -211,7 +210,7 @@ function beginUtterance(preroll) {
 // Hands-free utterances end on silence, not on release.
 function releaseTalk() {
   if (!recording || vad.auto) return;
-  endUtterance(true, 'Too short; hold while speaking.');
+  endUtterance(true, vad.continued ? '' : 'Too short; hold while speaking.');
 }
 
 function endUtterance(keep, shortMessage) {
@@ -225,13 +224,14 @@ function endUtterance(keep, shortMessage) {
   frames = [];
   const rate = Math.min(ctx.sampleRate, TARGET_RATE);
   const wav = wavBlob(downsample(samples, ctx.sampleRate), rate), at = startedAt, language = $('language').value.trim();
+  const joined = vad.continued;  // a later piece of the same recording
   const shown = entry('Transcribing…', clock(at), 'entry pending');
   pending++;
   idleStatus();
-  queue = queue.then(() => transcribe(wav, at, language, shown)).finally(() => { pending--; idleStatus(); });
+  queue = queue.then(() => transcribe(wav, at, language, joined, shown)).finally(() => { pending--; idleStatus(); });
 }
 
-async function transcribe(wav, at, language, shown) {
+async function transcribe(wav, at, language, joined, shown) {
   const form = new FormData();
   form.append('file', wav, 'speech.wav');
   if (language) form.append('language', language);
@@ -250,7 +250,7 @@ async function transcribe(wav, at, language, shown) {
     shown.div.className = 'entry';
     shown.text.textContent = body.text;
     shown.meta.textContent = meta;
-    transcript.push({at, text: body.text, meta});
+    transcript.push({at, text: body.text, meta, joined});
     save();
   } catch (err) {
     shown.div.className = 'error';
@@ -258,7 +258,8 @@ async function transcribe(wav, at, language, shown) {
   }
 }
 
-function transcriptText() { return transcript.map(e => e.text).join('\n') + (transcript.length ? '\n' : ''); }
+// Pieces of one recording run on in a paragraph; each recording starts a new line.
+function transcriptText() { return transcript.map((e, i) => (i && !e.joined ? '\n' : i ? ' ' : '') + e.text).join('') + (transcript.length ? '\n' : ''); }
 
 $('copy').onclick = async () => {
   try { await navigator.clipboard.writeText(transcriptText()); status('Copied'); }
