@@ -167,3 +167,13 @@ def test_multipart_fields_keeps_binary_payload():
     )
     fields = serve_stt.multipart_fields(f"multipart/form-data; boundary={boundary}", body)
     assert fields == {"file": payload, "language": b"en"}
+
+
+def test_page_uses_relative_urls(client):
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["cache-control"] == "no-store"
+    assert "fetch('audio/transcriptions'" in response.text
+    assert "fetch('/" not in response.text  # absolute URLs would miss the /v1 route prefix
+    assert f'<span id="version">{serve_stt.VERSION}</span>' in response.text

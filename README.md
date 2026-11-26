@@ -7,7 +7,7 @@ The head, LLM workers, and TTS workers all run this one image, so the Ray versio
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py; serve_chat.py, chat.html), importable as serve_tts:app, serve_stt:app, serve_chat:app
+tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py, stt.html; serve_chat.py, chat.html), importable as serve_tts:app, serve_stt:app, serve_chat:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
@@ -168,7 +168,9 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 `serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover it, so the image adds no packages for it.
 
-Mount it at `route_prefix: /v1`: `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/health`.
+Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `GET /v1/models`, `GET /v1/health`.
+
+- The page records speech and appends each utterance's transcript to a running transcript, which it keeps in the browser's local storage and can copy or download as text. Hold the button (or Space) to talk, or turn on hands-free, which starts and stops on speech with the voice chat page's voice activity detection and keeps listening until turned off; a hands-free utterance is cut every 30 s so long speech is transcribed as it goes. Utterances are sent one at a time, in order, while recording continues. The header shows the image version, as on the other pages. It uses relative URLs, so open it with the trailing slash (`/v1/`).
 
 - The multipart form takes `file`, plus optional `language` (code or English name; detected from the first 30 s when omitted), `response_format` (`json`, `verbose_json`, `text`), and `model` (ignored). Replies carry `text`, `language` as a lowercase English name, and `duration`, plus `X-Transcribe-Seconds`, `X-Audio-Seconds`, `X-RTF`. Errors use OpenAI's `{"error": {"message": ...}}`.
 - Uploads are limited to 25 MB and 300 s. Audio is decoded by libsndfile (WAV, FLAC, OGG, MP3; no FFmpeg, so no M4A or WebM), mixed to mono, and resampled to 16 kHz. Audio past 30 s is decoded long-form with timestamps.
