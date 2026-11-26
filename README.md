@@ -168,9 +168,9 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 `serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
 
-Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers.
+The routes carry `/v1` themselves, as `mlx-stt-svc`'s do, so mount it at `route_prefix: /` on its own host (or at any prefix, such as `/stt`): `GET /` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers.
 
-- The page is deliberately plain, for trying STT out: Record, then Stop uploads the recording as 16 kHz WAV to `audio/transcriptions` and shows the text, with the language detected. It keeps nothing between visits. A page change redeploys the GPU replica and reloads Whisper, so features belong in the [meeting notes](#meeting-notes) app instead. It uses relative URLs, so open it with the trailing slash (`/v1/`).
+- The page is deliberately plain, for trying STT out: Record, then Stop uploads the recording as 16 kHz WAV to `v1/audio/transcriptions` and shows the text, with the language detected. It keeps nothing between visits. A page change redeploys the GPU replica and reloads Whisper, so features belong in the [meeting notes](#meeting-notes) app instead. It uses relative URLs, so behind a prefix open it with the trailing slash (`/stt/`).
 
 `audio/stream` takes 16 kHz mono 16-bit little-endian PCM as binary messages, then `{"type": "stop"}`, with an optional `language` query parameter. It answers with a `segment` event (`start`, `end` in seconds from the first sample, `text`, `language`, `paragraph`, `seconds` spent transcribing) for each piece with text, `error` for a piece that failed (the stream goes on), and `done` after the last piece. While a piece is still going, a `partial` event (`start`, `text`) previews its text about every second of audio, when the GPU is free and no finished piece is waiting; the piece's `segment` has the same `start`, and no partial for a piece comes after it. Previews re-transcribe the piece from its start, so a 15 s piece costs up to 15 extra transcriptions of growing length; on the cluster a 7 s piece took 0.5–0.7 s, so one meeting keeps the GPU about half busy, and finished pieces and HTTP requests go first.
 
@@ -237,7 +237,7 @@ Mount it at its own route prefix, for example `route_prefix: /meeting`, and open
 
 | Setting | Default | Effect |
 |---|---|---|
-| `MEETING_STT_URL` | `http://localhost:8000/v1` | Base URL of this image's STT (`/health`, `/audio/stream`); `ws://` or `wss://` follows from `http://` or `https://` |
+| `MEETING_STT_URL` | `http://localhost:8000/v1` | This image's STT, including its `/v1` (`/health`, `/audio/stream`); `ws://` or `wss://` follows from `http://` or `https://` |
 | `MEETING_STT_TOKEN` | unset | Sent to STT as `Authorization: Bearer <token>` |
 | `MEETING_NUM_REPLICAS` | `1` | Replicas |
 | `MEETING_MAX_ONGOING_REQUESTS` | `16` | Meetings (and page requests) a replica serves at once |

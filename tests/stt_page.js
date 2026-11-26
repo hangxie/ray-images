@@ -45,7 +45,7 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 0));
   for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128).fill(0.5)});  // 1 s at 48 kHz
   await $('record').onclick();
   await settle();
-  check(uploads.length === 1 && uploads[0].url === 'audio/transcriptions', 'Stop uploads to audio/transcriptions');
+  check(uploads.length === 1 && uploads[0].url === 'v1/audio/transcriptions', 'Stop uploads to v1/audio/transcriptions');
   const file = uploads[0].form.fields.file, view = new DataView(file.value.parts[0]);
   check(file.filename === 'speech.wav' && file.value.type === 'audio/wav' && !uploads[0].form.fields.language,
     'as speech.wav, with the language left to the server');

@@ -22,7 +22,7 @@
 <button id="record" type="button">Record</button>
 <div id="status"></div>
 <script>
-// Records the microphone until Stop, then uploads it as 16 kHz WAV to audio/transcriptions; the language is detected.
+// Records the microphone until Stop, then uploads it as 16 kHz WAV to v1/audio/transcriptions; the language is detected.
 const $ = id => document.getElementById(id);
 const RATE = 16000, MAX_SECONDS = 290;  // the service takes up to 300 s per upload
 let ctx, frames = null;
@@ -86,7 +86,7 @@ async function stop() {
   const form = new FormData();
   form.append('file', wav(recorded, ctx.sampleRate), 'speech.wav');
   try {
-    const res = await fetch('audio/transcriptions', {method: 'POST', body: form});
+    const res = await fetch('v1/audio/transcriptions', {method: 'POST', body: form});
     const body = await res.json();
     if (!res.ok) throw new Error(body.error?.message || res.statusText);
     if (body.text) show(body.text);

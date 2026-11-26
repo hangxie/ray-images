@@ -23,8 +23,8 @@ import serve_stt
 
 
 class STTServer:
-    """serve_stt's app under /v1 on a loopback port, recording each request's path, query and Authorization, and
-    which WebSocket handlers have returned."""
+    """serve_stt's app on a loopback port, recording each request's path, query and Authorization, and which
+    WebSocket handlers have returned."""
 
     def __init__(self, whisper):
         self.requests: list[tuple[str, str, str]] = []
@@ -34,11 +34,9 @@ class STTServer:
         async def app(scope, receive, send):
             if scope["type"] in ("http", "websocket"):
                 headers = dict(scope["headers"])
-                path = scope["path"].removeprefix("/v1")
                 self.requests.append(
-                    (path, scope["query_string"].decode(), headers.get(b"authorization", b"").decode())
+                    (scope["path"], scope["query_string"].decode(), headers.get(b"authorization", b"").decode())
                 )
-                scope = {**scope, "path": path, "raw_path": path.encode()}
             await serve_stt.api(scope, receive, send)
             if scope["type"] == "websocket":
                 self.finished.append(scope["path"])
@@ -126,7 +124,7 @@ def test_page_language_menu_has_stt_languages(client, stt):
     presets = re.findall(r'<option value="([a-z]+)">', client.get("/").text)
     assert presets == ["english", "chinese", "spanish", "french", "korean", "japanese", "other"]
     assert all(p in codes for p in presets[:-1])  # each preset is a name STT accepts
-    assert [r for r in stt.requests if r[0] == "/health"] == [("/health", "", "Bearer stt-pat")]  # read once
+    assert [r for r in stt.requests if r[0] == "/v1/health"] == [("/v1/health", "", "Bearer stt-pat")]  # read once
 
 
 def test_page_loads_while_stt_is_down():
@@ -168,7 +166,7 @@ def test_stream_is_relayed_to_stt(client, stt, replica):  # noqa: F811
         ("Hello world.", "french", True),
         ("Hello world.", "french", True),
     ]
-    assert ("/audio/stream", "language=french", "Bearer stt-pat") in stt.requests
+    assert ("/v1/audio/stream", "language=french", "Bearer stt-pat") in stt.requests
     assert sum(a.size for a, _ in replica.calls) > 6 * 16000  # the audio reached Whisper
 
 
@@ -200,4 +198,4 @@ def test_page_leaving_closes_the_stt_stream(client, stt):
         if stt.finished:
             break
         time.sleep(0.01)
-    assert stt.finished == ["/audio/stream"]
+    assert stt.finished == ["/v1/audio/stream"]
