@@ -67,14 +67,18 @@ RUN pip install "brotli>=1.2" \
 # inherits the system packages (Ray, torch, CUDA libraries) and adds only what qwen-tts needs on top; torch/torchaudio
 # are constrained to the system versions so no second copy is installed. TTS replicas run its interpreter through
 # runtime_env py_executable (tts/app/serve_tts.py). Kept after the vLLM layers so a TTS change rebuilds only this.
+# Silero VAD (torch only, model in the wheel) tells speech from music and noise for STT's live stream.
 ARG QWEN_TTS_VERSION=0.1.1
-LABEL io.github.hangxie.ray-images.qwen-tts-version="${QWEN_TTS_VERSION}"
+ARG SILERO_VAD_VERSION=6.3
+LABEL io.github.hangxie.ray-images.qwen-tts-version="${QWEN_TTS_VERSION}" \
+      io.github.hangxie.ray-images.silero-vad-version="${SILERO_VAD_VERSION}"
 COPY --chown=ray:users tts/check_requirements.py /tmp/check_requirements.py
 RUN python3 -m venv --system-site-packages /home/ray/tts-venv \
     && pip list --format=freeze | grep -E '^(torch|torchaudio)==' > /tmp/constraints.txt \
     && /home/ray/tts-venv/bin/pip install --constraint /tmp/constraints.txt \
-       "qwen-tts==${QWEN_TTS_VERSION}" "scipy>=1.14.0" soundfile \
-    && /home/ray/tts-venv/bin/python /tmp/check_requirements.py "qwen-tts==${QWEN_TTS_VERSION}" scipy soundfile \
+       "qwen-tts==${QWEN_TTS_VERSION}" "silero-vad==${SILERO_VAD_VERSION}" "scipy>=1.14.0" soundfile \
+    && /home/ray/tts-venv/bin/python /tmp/check_requirements.py "qwen-tts==${QWEN_TTS_VERSION}" \
+       "silero-vad==${SILERO_VAD_VERSION}" scipy soundfile \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
@@ -85,7 +89,7 @@ RUN python3 -m venv --system-site-packages /home/ray/tts-venv \
 COPY --chown=ray:users tts/app/ /home/ray/tts/
 ENV PYTHONPATH=/home/ray/tts${PYTHONPATH:+:${PYTHONPATH}}
 RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, serve_stt, serve_chat, transformers; print('Serve apps:', serve_tts.app, serve_stt.app, serve_chat.app, 'system transformers', transformers.__version__)" \
-    && /home/ray/tts-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts; assert transformers.__version__ == '4.57.3', transformers.__version__; print('TTS venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
+    && /home/ray/tts-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts, silero_vad; silero_vad.load_silero_vad(); assert transformers.__version__ == '4.57.3', transformers.__version__; print('TTS venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
 
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev

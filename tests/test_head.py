@@ -15,7 +15,17 @@ import serve_stt
 import serve_tts
 
 APP = Path(__file__).resolve().parent.parent / "tts" / "app"
-REPLICA_ONLY = ["torch", "torchaudio", "transformers", "qwen_tts", "soundfile", "accelerate", "librosa", "gradio"]
+REPLICA_ONLY = [
+    "torch",
+    "torchaudio",
+    "transformers",
+    "qwen_tts",
+    "soundfile",
+    "accelerate",
+    "librosa",
+    "gradio",
+    "silero_vad",
+]
 # The head's environment as far as the apps can tell: a finder that refuses the replica-only packages. (Entries of None
 # in sys.modules would not do: scipy looks torch up there and expects a module.)
 HEAD = """
@@ -120,7 +130,7 @@ def test_stt_deployment_options():
     deployment = cast(Any, serve_stt.STT)
     assert deployment.ray_actor_options["num_gpus"] == 1
     assert "py_executable" in deployment.ray_actor_options["runtime_env"]
-    assert deployment.max_ongoing_requests == 1
+    assert deployment.max_ongoing_requests == 16  # each open stream is one ongoing request; a lock serialises the GPU
 
 
 def test_chat_deployment_options():

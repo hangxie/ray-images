@@ -25,7 +25,10 @@ def arg(name):
     return find(rf"^ARG {name}=(\S+)$")
 
 
-@pytest.mark.parametrize(("package", "name"), [("ray", "RAY_VERSION"), ("qwen-tts", "QWEN_TTS_VERSION")])
+@pytest.mark.parametrize(
+    ("package", "name"),
+    [("ray", "RAY_VERSION"), ("qwen-tts", "QWEN_TTS_VERSION"), ("silero-vad", "SILERO_VAD_VERSION")],
+)
 def test_dockerfile_args(package, name):
     assert version(package) == arg(name)
 
