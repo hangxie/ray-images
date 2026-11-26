@@ -22,7 +22,7 @@ const context = {
     async resume() {}
   },
   AudioWorkletNode: class { constructor() { port = this.port = {}; } },
-  navigator: {mediaDevices: {getUserMedia: async () => { if (refuse) { refuse = false; throw new Error('denied'); } return {}; }}},
+  navigator: {mediaDevices: {getUserMedia: async () => { if (refuse) { refuse = false; throw Object.assign(new Error('Permission denied'), {name: 'NotAllowedError'}); } return {}; }}},
   fetch: async (url, init) => {
     uploads.push({url, form: init.body});
     return {ok: answer.status === 200, status: answer.status, statusText: 'error', json: async () => answer.body};
@@ -41,8 +41,8 @@ const settle = () => new Promise(resolve => setTimeout(resolve, 0));
 
 (async () => {
   await $('record').onclick();
-  check($('status').textContent === 'Microphone unavailable: denied' && !$('record').classList.set.has('on'),
-    'a refused microphone is reported');
+  check(/^Microphone blocked: allow it/.test($('status').textContent) && !$('record').classList.set.has('on'),
+    'a refused microphone says how to allow it');
   await $('record').onclick();
   check($('record').textContent === 'Stop' && $('record').classList.set.has('on'), 'Record retries and starts recording');
   for (let i = 0; i < 375; i++) port.onmessage({data: new Float32Array(128).fill(0.5)});  // 1 s at 48 kHz

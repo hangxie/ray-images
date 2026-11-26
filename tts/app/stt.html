@@ -99,9 +99,16 @@ async function stop() {
   }
 }
 
+// Browsers remember a refusal for the site and then fail at once without asking again, so say where to undo it.
+function micError(err) {
+  return err.name === 'NotAllowedError'
+    ? 'Microphone blocked: allow it for this site in the browser (the icon by the address bar), then click Record again.'
+    : `Microphone unavailable: ${err.message}`;
+}
+
 $('record').onclick = async () => {
   if (frames) { stop(); return; }
-  try { await start(); } catch (err) { $('status').textContent = `Microphone unavailable: ${err.message}`; }
+  try { await start(); } catch (err) { $('status').textContent = micError(err); }
 };
 </script>
 </body>

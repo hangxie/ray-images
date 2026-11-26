@@ -36,7 +36,7 @@ class WebSocket {
   send(data) { this.sent.push(data); }
   close() { this.readyState = 3; }
 }
-let port;
+let port, refuse = true;  // the first request for the microphone is refused, as a remembered refusal is
 const storage = {language: 'German'};  // free text saved by the page before the language menu
 const context = {
   document, WebSocket, console, setTimeout, setInterval,
@@ -51,7 +51,7 @@ const context = {
   AudioWorkletNode: class { constructor() { port = this.port = {}; } },
   location: {href: 'https://apps.example/meeting/', protocol: 'https:'},
   localStorage: {getItem: k => storage[k] ?? null, setItem: (k, v) => { storage[k] = v; }},
-  navigator: {mediaDevices: {getUserMedia: async () => ({})}},
+  navigator: {mediaDevices: {getUserMedia: async () => { if (refuse) { refuse = false; throw Object.assign(new Error('Permission denied'), {name: 'NotAllowedError'}); } return {}; }}},
   confirm: () => true,
 };
 vm.createContext(context);
@@ -75,6 +75,8 @@ const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)
   $('language').onchange();
   check($('language-other').hidden && storage.language === 'chinese', 'a preset hides Other and is saved');
 
+  await $('meeting').onclick();
+  check(sockets.length === 0 && /Microphone blocked: allow it/.test($('status').textContent), 'a refused microphone says how to allow it');
   await $('meeting').onclick();
   const socket = sockets[0];
   check(socket?.url === 'wss://apps.example/meeting/api/stream?language=chinese', `stream URL ${socket?.url}`);

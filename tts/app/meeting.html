@@ -178,8 +178,15 @@ function meetingUi() {
   idleStatus();
 }
 
+// Browsers remember a refusal for the site and then fail at once without asking again, so say where to undo it.
+function micError(err) {
+  return err.name === 'NotAllowedError'
+    ? 'Microphone blocked: allow it for this site in the browser (the icon by the address bar), then click Start meeting again.'
+    : `Microphone unavailable: ${err.message}`;
+}
+
 async function startMeeting() {
-  if (!recorder) { try { await start(); } catch (err) { status(`Microphone unavailable: ${err.message}`); return; } }
+  if (!recorder) { try { await start(); } catch (err) { status(micError(err)); return; } }
   await ctx.resume();
   const url = new URL('api/stream', location.href), lang = language();
   url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
