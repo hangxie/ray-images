@@ -11,12 +11,14 @@ the client-IP allowlist, which is gone: access control belongs to the deployment
 import asyncio
 import base64
 import contextlib
+import html
 import http.client
 import json
 import logging
 import os
 import queue
 import re
+import select
 import socket
 import threading
 import time
@@ -31,6 +33,7 @@ from ray import serve
 from starlette.exceptions import HTTPException
 
 ROOT = Path(__file__).resolve().parent
+VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant in a spoken conversation. Reply in the language the user speaks. "
     "Keep answers brief, one to three short sentences, unless asked for more detail. "
@@ -44,6 +47,8 @@ BACKEND_TIMEOUT = 120
 # mlx-tts-svc answers 409 and Ray Serve 503/429 while busy, such as during a txt2m4b run; wait this long for a slot.
 TTS_BUSY_WAIT = 20
 TTS_BUSY_STATUSES = (409, 429, 503)
+POOL_IDLE_PER_ORIGIN = 8  # idle keep-alive connections kept per backend; more are closed
+DRAIN_TIMEOUT = 5  # how long to wait for the rest of a TTS stream after its `done` before giving up on reuse
 
 # A chunk ends at sentence punctuation; ASCII stops need a following space so "3.14" stays whole. The first chunk may
 # also end at a comma once it is long enough, so playback starts sooner, and so may any chunk that grows too long.
@@ -151,19 +156,75 @@ class BackendError(Exception):
         self.status = status
 
 
+class Pool:
+    """Idle keep-alive backend connections, shared by a replica's turns.
+
+    Every STT call and TTS sentence used to open its own connection, and through an HTTPS Gateway the TLS handshake
+    was most of each call's overhead. A connection goes back here only after its response was read to the end.
+    """
+
+    def __init__(self):
+        self.idle: dict[tuple[str, str], list[http.client.HTTPConnection]] = {}
+        self.lock = threading.Lock()
+
+    def get(self, url, timeout):
+        """A connection for `url`'s origin and whether it is a reused one; a new one is not connected yet."""
+        parts = urlsplit(url)
+        key = (parts.scheme, parts.netloc)
+        while True:
+            with self.lock:
+                connection = self.idle.get(key, []).pop() if self.idle.get(key) else None
+            if connection is None:
+                cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+                return cls(parts.netloc, timeout=timeout), parts, False
+            if alive(connection):
+                connection.timeout = timeout
+                cast(socket.socket, connection.sock).settimeout(timeout)
+                return connection, parts, True
+            connection.close()
+
+    def put(self, connection, parts):
+        with self.lock:
+            idle = self.idle.setdefault((parts.scheme, parts.netloc), [])
+            if len(idle) < POOL_IDLE_PER_ORIGIN:
+                idle.append(connection)
+                return
+        connection.close()
+
+
+def alive(connection):
+    """Whether an idle connection can take a request: a readable socket means the server closed it (or sent junk)."""
+    sock = connection.sock
+    if sock is None:
+        return False
+    try:
+        return not select.select([sock], [], [], 0)[0]
+    except (OSError, ValueError):
+        return False
+
+
+# What a request on a pooled connection the server has already closed fails with; a timeout is not one of them, since
+# the server may still be working on the request.
+STALE = (ConnectionError, http.client.BadStatusLine)
+
+
+def reusable(response):
+    return response.isclosed() and not response.will_close
+
+
 class Turn:
     """One request's pipeline: events for the browser, and the backend connections to cut on interrupt.
 
     The backend workers are threads; `emit` hands their events to the response's event loop.
     """
 
-    def __init__(self, loop, tokens):
-        self.loop, self.tokens = loop, tokens
+    def __init__(self, loop, tokens, pool):
+        self.loop, self.tokens, self.pool = loop, tokens, pool
         self.events: asyncio.Queue[dict] = asyncio.Queue()
         self.cancelled = threading.Event()
         # Each connection's socket, kept here because http.client drops `connection.sock` in getresponse() when the
         # response closes the connection (HTTP/1.0, `Connection: close`) while the response still reads from it.
-        self.connections: dict[http.client.HTTPConnection, socket.socket] = {}
+        self.connections: dict[http.client.HTTPConnection, tuple[socket.socket, object]] = {}
         self.lock = threading.Lock()
 
     def emit(self, **event):
@@ -171,16 +232,25 @@ class Turn:
 
     def request(self, name, url, body, content_type, timeout=BACKEND_TIMEOUT):
         """POST to a backend and return its response once the status is 2xx; the connection is tracked until closed."""
-        connection, parts = connect(url, timeout)
         headers = {"Content-Type": content_type, **auth(self.tokens[name])}
-        connection.connect()
-        with self.lock:
-            if self.cancelled.is_set():
-                connection.close()
-                raise ConnectionAbortedError("turn cancelled")
-            self.connections[connection] = connection.sock
-        connection.request("POST", parts.path + (f"?{parts.query}" if parts.query else ""), body, headers)
-        response = connection.getresponse()
+        while True:
+            connection, parts, reused = self.pool.get(url, timeout)
+            if not reused:
+                connection.connect()
+            with self.lock:
+                if self.cancelled.is_set():
+                    connection.close()
+                    raise ConnectionAbortedError("turn cancelled")
+                self.connections[connection] = (cast(socket.socket, connection.sock), parts)
+            try:
+                connection.request("POST", parts.path + (f"?{parts.query}" if parts.query else ""), body, headers)
+                response = connection.getresponse()
+                break
+            except (OSError, http.client.HTTPException) as exc:
+                self.close(connection)
+                # A reused connection the server closed before the request arrived: try again on a new one.
+                if not reused or self.cancelled.is_set() or not isinstance(exc, STALE):
+                    raise
         if not 200 <= response.status < 300:
             detail = response.read(2000).decode(errors="replace")
             try:
@@ -188,20 +258,25 @@ class Turn:
                 detail = error.get("message", detail) if isinstance(error, dict) else error
             except (ValueError, AttributeError):
                 pass
-            self.close(connection)
+            self.close(connection, response)
             raise BackendError(name, response.status, detail)
         return connection, response
 
-    def close(self, connection):
+    def close(self, connection, response=None):
+        """Done with a connection: back to the pool when `response` was read to the end, else closed."""
         with self.lock:
-            self.connections.pop(connection, None)
-        connection.close()
+            _, parts = self.connections.pop(connection, (None, None))
+            keep = response is not None and parts is not None and reusable(response) and not self.cancelled.is_set()
+        if keep:
+            self.pool.put(connection, parts)
+        else:
+            connection.close()
 
     def cancel(self):
         """Abort every in-flight backend request; TTS drops a synthesis whose client disconnects."""
         with self.lock:
             self.cancelled.set()
-            sockets = list(self.connections.values())
+            sockets = [sock for sock, _ in self.connections.values()]
         for sock in sockets:
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
@@ -211,24 +286,26 @@ def auth(token):
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
-def connect(url, timeout):
-    parts = urlsplit(url)
-    cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-    return cls(parts.netloc, timeout=timeout), parts
-
-
-def tts_get(config, path):
+def tts_get(pool, config, path):
     """GET a JSON document from the TTS service; a non-2xx answer (busy, down) raises BackendError."""
-    connection, parts = connect(config["tts_url"], 10)
-    try:
-        connection.request("GET", parts.path + path, headers=auth(config["tokens"]["TTS"]))
-        response = connection.getresponse()
-        body = response.read()
+    while True:
+        connection, parts, reused = pool.get(config["tts_url"], 10)
+        try:
+            connection.request("GET", parts.path + path, headers=auth(config["tokens"]["TTS"]))
+            response = connection.getresponse()
+            body = response.read()
+        except (OSError, http.client.HTTPException) as exc:
+            connection.close()
+            if not reused or not isinstance(exc, STALE):
+                raise
+            continue
+        if reusable(response):
+            pool.put(connection, parts)
+        else:
+            connection.close()
         if not 200 <= response.status < 300:
             raise BackendError("TTS", response.status, body[:200].decode(errors="replace"))
         return json.loads(body)
-    finally:
-        connection.close()
 
 
 async def read_body(request, limit):
@@ -266,7 +343,7 @@ def transcribe(config, turn, audio):
     try:
         return json.loads(response.read())
     finally:
-        turn.close(connection)
+        turn.close(connection, response)
 
 
 def run_llm(config, turn, messages, chunks):
@@ -317,7 +394,7 @@ def run_llm(config, turn, messages, chunks):
                     for chunk in chunker.feed(text):
                         chunks.put(chunk)
         finally:
-            turn.close(connection)
+            turn.close(connection, response)
         if not finished:
             raise BackendError("LLM", 200, "stream ended before [DONE]")
         for chunk in chunker.feed("", final=True):
@@ -361,7 +438,8 @@ def run_tts(config, turn, chunks, voice, language):
                         time.sleep(0.3)
                 try:
                     if response.getheader("Content-Type", "").startswith("application/x-ndjson"):
-                        stream_tts(turn, response, index, text)
+                        if stream_tts(turn, response, index, text):
+                            finish(connection, response)
                     else:
                         wav = response.read()
                         rtf = response.getheader("X-RTF")
@@ -375,7 +453,7 @@ def run_tts(config, turn, chunks, voice, language):
                             rtf=float(rtf) if rtf else None,
                         )
                 finally:
-                    turn.close(connection)
+                    turn.close(connection, response)
                 index += 1
             except Exception as exc:
                 failed = True
@@ -385,12 +463,23 @@ def run_tts(config, turn, chunks, voice, language):
         turn.emit(type="tts_done")
 
 
+def finish(connection, response):
+    """Read the rest of a stream after its last event (the chunked end), so its connection can go back to the pool
+    and TTS sees the stream finish instead of an abandoned one."""
+    with contextlib.suppress(OSError, http.client.HTTPException, ValueError):
+        if connection.sock is not None:
+            connection.sock.settimeout(DRAIN_TIMEOUT)
+        response.read()
+
+
 def stream_tts(turn, response, index, text):
-    """Forward each streamed piece of 16-bit PCM as an `audio` event; the chunk's text rides on its first piece."""
+    """Forward each streamed piece of 16-bit PCM as an `audio` event; the chunk's text rides on its first piece.
+
+    True once the stream's `done` arrives, False when the turn was cancelled first."""
     part = 0
     for line in response:
         if turn.cancelled.is_set():
-            return
+            return False
         event = json.loads(line)
         if event["type"] == "audio":
             seconds = len(base64.b64decode(event["pcm"])) / 2 / event["sample_rate"]
@@ -407,7 +496,7 @@ def stream_tts(turn, response, index, text):
         elif event["type"] == "error":
             raise BackendError("TTS", 500, event["error"])
         elif event["type"] == "done":
-            return
+            return True
     raise BackendError("TTS", 502, "stream ended without finishing")
 
 
@@ -458,13 +547,14 @@ def line(event):
 class Chat:
     def __init__(self, settings):
         self.config = settings
+        self.pool = Pool()
         self.languages = None  # TTS's languages, read from its /health on first use
 
     def tts_languages(self):
         """Languages the TTS service accepts, read from its /health once it answers; until then each turn asks again."""
         if self.languages is None:
             try:
-                health = tts_get(self.config, "/health")
+                health = tts_get(self.pool, self.config, "/health")
                 if not isinstance(health, dict):
                     raise ValueError("TTS /health is not a JSON object")
                 self.languages = set(health.get("languages") or ())
@@ -474,7 +564,8 @@ class Chat:
 
     @api.get("/")
     def page(self):
-        return reply(200, (ROOT / "chat.html").read_bytes(), "text/html; charset=utf-8")
+        page = (ROOT / "chat.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
+        return reply(200, page.encode(), "text/html; charset=utf-8")
 
     @api.get("/health")
     def health(self):
@@ -483,6 +574,7 @@ class Chat:
             200,
             {
                 "status": "ok",
+                "version": VERSION,
                 "stt": c["stt_url"],
                 "llm": c["llm_url"],
                 "llm_model": c["llm_model"],
@@ -494,7 +586,7 @@ class Chat:
     @api.get("/api/voices")
     async def voices(self):
         try:
-            voices = await asyncio.to_thread(tts_get, self.config, "/voices")
+            voices = await asyncio.to_thread(tts_get, self.pool, self.config, "/voices")
             if not isinstance(voices, list) or not all(isinstance(v, str) for v in voices):
                 raise ValueError("TTS /voices is not a list of names")
         except (OSError, ValueError, BackendError) as exc:
@@ -519,7 +611,7 @@ class Chat:
             past = history(req.get("history", []))
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             return reply(400, {"error": str(exc)})
-        turn = Turn(asyncio.get_running_loop(), self.config["tokens"])
+        turn = Turn(asyncio.get_running_loop(), self.config["tokens"], self.pool)
         return StreamingResponse(
             self.converse(turn, started, audio, text, voice, past),
             media_type="application/x-ndjson; charset=utf-8",

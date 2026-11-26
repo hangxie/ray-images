@@ -193,6 +193,8 @@ Mount it at its own route prefix, for example `route_prefix: /chat`, and open th
 - STT, the LLM, and TTS are URLs, so each can be this cluster's Serve apps, the Mac's llama.cpp, or anything else with the same API.
 - A turn is one streamed request that mostly waits on the backends, so a replica takes up to `CHAT_MAX_ONGOING_REQUESTS` turns at once instead of TTS's one.
 - A client that disconnects cancels its turn: the replica shuts its in-flight STT, LLM, and TTS connections, so TTS stops synthesizing at the next frame.
+- Backend connections are kept alive and shared by a replica's turns, so STT calls and TTS sentences skip the TCP and TLS handshakes; through the homelab's HTTPS Gateway the handshake was ~28 of the ~33 ms each call cost. A connection is reused only after its response was read to the end, a pooled one the server has closed is replaced on the next request, and an interrupted turn's connections are closed, not pooled. The streamed LLM reply's connection is closed after `[DONE]`, since it is one call per turn.
+- The page header and `/health` show the image tag, which the build writes to `VERSION` next to the app; it reads `dev` outside the image.
 - There is no client-IP allowlist, unlike on `media`; access control belongs to the deployment in front, as for TTS and STT. The `CHAT_*_TOKEN`s are only what the replica sends to its backends, for example a PAT when TTS sits behind the Gateway's bearer check.
 
 | Setting | Default | Effect |

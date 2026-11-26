@@ -6,11 +6,14 @@ and cancellation.
 
 import asyncio
 import base64
+import http.client
 import json
+import socket
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, cast
+from urllib.parse import urlsplit
 
 import pytest
 from conftest import serve_client
@@ -32,9 +35,12 @@ class Backends:
         self.tts_hold = None  # an Event: after the first piece, wait for the client to hang up and set it
         self.discovery: list[int] = []  # statuses for the next TTS /health and /voices requests, then 200
         self.requests: list[tuple[str, Any]] = []
+        self.ports: list[tuple[str, int]] = []  # (request, client port): which connection each request came on
         backends = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"  # keep-alive, as the Gateway's Envoy speaks it
+
             def log_message(self, *args):
                 pass
 
@@ -42,12 +48,24 @@ class Backends:
                 body = body if isinstance(body, bytes) else json.dumps(body).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
                 for name, value in (headers or {}).items():
                     self.send_header(name, value)
                 self.end_headers()
                 self.wfile.write(body)
 
+            def start_stream(self, content_type):
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+
+            def chunk(self, data):
+                self.wfile.write(f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                self.wfile.flush()
+
             def do_GET(self):
+                backends.ports.append(("GET " + self.path, self.client_address[1]))
                 backends.requests.append(("GET " + self.path, self.headers.get("Authorization")))
                 if backends.discovery:
                     return self.send(backends.discovery.pop(0), {"error": "busy"})
@@ -59,6 +77,7 @@ class Backends:
 
             def do_POST(self):
                 body = self.rfile.read(int(self.headers["Content-Length"]))
+                backends.ports.append((self.path, self.client_address[1]))
                 if self.path == "/v1/audio/transcriptions":
                     backends.requests.append(("stt", body))
                     if backends.stt_status != 200:
@@ -69,17 +88,15 @@ class Backends:
                     backends.requests.append(("llm", payload))
                     if backends.llm_status != 200:
                         return self.send(backends.llm_status, {"error": {"message": "bad model"}})
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/event-stream")
-                    self.end_headers()
+                    self.start_stream("text/event-stream")
                     for delta in backends.reply:
                         event = {"choices": [{"delta": {"content": delta}}]}
-                        self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
-                        self.wfile.flush()
+                        self.chunk(b"data: " + json.dumps(event).encode() + b"\n\n")
                     if backends.llm_end == "error":
-                        self.wfile.write(b'data: {"error": {"message": "context overflow", "code": 500}}\n\n')
+                        self.chunk(b'data: {"error": {"message": "context overflow", "code": 500}}\n\n')
                     elif backends.llm_end == "done":
-                        self.wfile.write(b"data: [DONE]\n\n")
+                        self.chunk(b"data: [DONE]\n\n")
+                    self.chunk(b"")
                     return None
                 backends.requests.append(("tts", payload))
                 if backends.tts_busy:
@@ -87,18 +104,17 @@ class Backends:
                     return self.send(503, {"error": "busy"})
                 if backends.tts_wav:
                     return self.send(200, b"RIFF-wav", "audio/wav", {"X-RTF": "0.5", "X-Audio-Seconds": "1.25"})
-                self.send_response(200)
-                self.send_header("Content-Type", "application/x-ndjson")
-                self.end_headers()
+                self.start_stream("application/x-ndjson")
                 pcm = base64.b64encode(b"\0\0" * 2400).decode()  # 0.1 s at 24 kHz
                 for _ in range(2):
-                    self.wfile.write(json.dumps({"type": "audio", "sample_rate": 24000, "pcm": pcm}).encode() + b"\n")
-                    self.wfile.flush()
+                    self.chunk(json.dumps({"type": "audio", "sample_rate": 24000, "pcm": pcm}).encode() + b"\n")
                     if backends.tts_hold is not None:
                         self.connection.recv(1)  # returns once the client shuts the connection
                         backends.tts_hold.set()
+                        self.close_connection = True
                         return None
-                self.wfile.write(b'{"type": "done"}\n')
+                self.chunk(b'{"type": "done"}\n')
+                self.chunk(b"")
                 return None
 
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
@@ -130,6 +146,7 @@ def make_replica(backends, **overrides):
         **overrides,
     }
     replica.languages = None
+    replica.pool = serve_chat.Pool()
     return replica
 
 
@@ -241,11 +258,13 @@ def test_page_uses_relative_urls(client):
     assert response.headers["content-type"].startswith("text/html")
     assert "fetch('api/chat'" in response.text and "fetch('api/voices')" in response.text
     assert "fetch('/" not in response.text  # absolute URLs would miss the route prefix
+    assert f'<span id="version">{serve_chat.VERSION}</span>' in response.text
 
 
 def test_health(client, backends):
     assert client.get("/health").json() == {
         "status": "ok",
+        "version": serve_chat.VERSION,
         "stt": f"{backends.url}/v1",
         "llm": f"{backends.url}/llm",
         "llm_model": "tiny-llm",
@@ -408,7 +427,7 @@ def test_disconnect_cancels_backend_requests(backends, replica):
     backends.tts_hold = threading.Event()
 
     async def main():
-        turn = serve_chat.Turn(asyncio.get_running_loop(), replica.config["tokens"])
+        turn = serve_chat.Turn(asyncio.get_running_loop(), replica.config["tokens"], replica.pool)
         events, first = [], asyncio.Event()
 
         async def consume():
@@ -508,3 +527,63 @@ def test_llm_stream_failure_after_200_is_an_error(client, backends, end, message
     assert {"type": "error", "stage": "llm", "message": message} in events
     assert events[-1]["type"] == "done" and events[-1]["reply"] == "Hello there. And then"
     assert [t["text"] for t in backends.sent("tts")] == ["Hello there."]  # the unfinished sentence is not spoken
+
+
+def test_backend_connections_are_reused(client, backends):
+    """TTS sentences and later turns reuse kept-alive connections instead of opening one per call."""
+    chat(client, audio=WAV)
+    chat(client, audio=WAV)
+    tts = [port for path, port in backends.ports if path == "/tts/api/tts"]
+    assert len(tts) == 4
+    assert len(set(tts)) < len(tts)
+    stt = [port for path, port in backends.ports if path == "/v1/audio/transcriptions"]
+    assert len(stt) == 2 and stt[1] in tts[:2]  # turn 2 starts on the connection turn 1 left in the pool
+
+
+def test_stale_pooled_connection_is_retried(client, backends, replica):
+    """A pooled connection the server has since dropped costs a retry on a new connection, not an error."""
+    listener = socket.create_server(("127.0.0.1", 0))
+
+    def hang_up():  # accepts, then closes as soon as a request arrives, like a server whose idle timeout just hit
+        conn, _ = listener.accept()
+        conn.recv(65536)
+        conn.close()
+
+    threading.Thread(target=hang_up, daemon=True).start()
+    stale = http.client.HTTPConnection("127.0.0.1", listener.getsockname()[1], timeout=5)
+    stale.connect()
+    parts = urlsplit(backends.url)
+    replica.pool.idle[(parts.scheme, parts.netloc)] = [stale]
+    events = chat(client, audio=WAV)
+    assert "error" not in types(events) and events[-1]["type"] == "done"
+    assert len(backends.sent("stt")) == 1
+    listener.close()
+
+
+def test_cancelled_turn_pools_nothing(backends, replica):
+    """Connections of an interrupted turn were shut, so none of them may go back to the pool."""
+    test_disconnect_cancels_backend_requests(backends, replica)
+    assert not any(replica.pool.idle.values())
+
+
+def test_timeout_on_a_pooled_connection_is_not_retried(client, backends, replica, monkeypatch):
+    """A pooled connection that times out may still have the request running, so the turn fails instead of resending."""
+    listener = socket.create_server(("127.0.0.1", 0))
+    held = []
+
+    def hold():  # accepts and reads the request, then never answers
+        conn, _ = listener.accept()
+        conn.recv(65536)
+        held.append(conn)
+
+    threading.Thread(target=hold, daemon=True).start()
+    slow = http.client.HTTPConnection("127.0.0.1", listener.getsockname()[1], timeout=5)
+    slow.connect()
+    parts = urlsplit(backends.url)
+    replica.pool.idle[(parts.scheme, parts.netloc)] = [slow]
+    monkeypatch.setattr(serve_chat, "BACKEND_TIMEOUT", 0.3)
+    monkeypatch.setattr(serve_chat.Turn.request, "__defaults__", (0.3,))
+    events = chat(client, audio=WAV)
+    assert events[0]["type"] == "error" and events[0]["stage"] == "stt"
+    assert backends.sent("stt") == []  # not resent to a new connection
+    listener.close()

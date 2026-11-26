@@ -329,6 +329,35 @@ def test_stream(voices_dir, no_cuda, tiny_decoder):
     assert {"synthesis_seconds", "first_audio_seconds", "rtf", "clipped_samples"} <= done.keys()
 
 
+def test_finished_stream_is_not_abandoned(voices_dir, no_cuda, tiny_decoder, monkeypatch):
+    """The thread emits `done` just before it returns; a stream that got there is not logged as a disconnect."""
+    replica = make_replica(voices_dir, FakeTTS(tiny_decoder))
+
+    def run(text, voice, seed, language, sampling, job):
+        replica.started = time.perf_counter()
+        for frame in torch.randint(0, 32, (6, CODE_GROUPS)):
+            job.stream.frame(frame)
+        job.stream.flush()
+        raise serve_tts.StreamFinished
+
+    generate_stream = replica.generate_stream
+
+    def slow_return(*args):
+        generate_stream(*args)
+        time.sleep(0.3)  # still running when the response body sees `done`
+
+    replica.run, replica.generate_stream = run, slow_return
+    logged = []
+    monkeypatch.setattr(serve_tts.logger, "info", lambda message, *args: logged.append(message))
+    client = serve_client(serve_tts, replica)
+    try:
+        events = ndjson(tts(client, stream=True))
+    finally:
+        serve_tts.api.dependency_overrides.clear()
+    assert events[-1]["type"] == "done"
+    assert not [m for m in logged if "abandoned" in m]
+
+
 def test_stream_error_event(voices_dir, no_cuda, tiny_decoder):
     replica = make_replica(voices_dir, FakeTTS(tiny_decoder))
 

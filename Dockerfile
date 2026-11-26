@@ -89,4 +89,6 @@ RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, ser
 
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev
+# A file, not ENV: Podman's cache reuses an ENV layer when only VERSION changes, but reruns a RUN that uses it
+RUN printf '%s\n' "${VERSION}" > /home/ray/tts/VERSION
 LABEL org.opencontainers.image.version="${VERSION}"
