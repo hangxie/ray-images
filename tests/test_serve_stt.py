@@ -177,9 +177,16 @@ def test_multipart_fields_keeps_binary_payload():
     assert fields == {"file": payload, "language": b"en"}
 
 
-def test_no_page(client):
-    """The meeting page is serve_meeting's, so a page change doesn't reload Whisper."""
-    assert client.get("/").status_code == 404
+def test_page_uses_relative_urls(client):
+    """A plain recording page; meeting notes and anything fancier are serve_meeting's, so they don't reload Whisper."""
+    response = client.get("/")
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "text/html; charset=utf-8"
+    assert response.headers["cache-control"] == "no-store"
+    assert "fetch('audio/transcriptions'" in response.text
+    assert "fetch('/" not in response.text  # absolute URLs would miss the /v1 route prefix
+    assert "WebSocket" not in response.text and "localStorage" not in response.text
+    assert f'<span id="version">{serve_stt.VERSION}</span>' in response.text
 
 
 FRAME = serve_stt.Segmenter.FRAME / 16000  # seconds

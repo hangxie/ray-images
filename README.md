@@ -7,7 +7,7 @@ The head, LLM workers, and TTS workers all run this one image, so the Ray versio
 ```text
 Dockerfile                  the image
 scripts/                    build-time helpers (FlashInfer cache pruning)
-tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py; serve_chat.py, chat.html; serve_meeting.py, meeting.html), importable as serve_tts:app, serve_stt:app, serve_chat:app, serve_meeting:app
+tts/app/                    Serve apps (serve_tts.py, index.html; serve_stt.py, stt.html; serve_chat.py, chat.html; serve_meeting.py, meeting.html), importable as serve_tts:app, serve_stt:app, serve_chat:app, serve_meeting:app
 tts/check_requirements.py   build-time dependency check for the TTS virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
@@ -168,7 +168,9 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 `serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the TTS virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
 
-Mount it at `route_prefix: /v1`: `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers. STT has no page of its own: the recording page moved to the meeting notes app, so a page change no longer redeploys the GPU replica and reloads Whisper.
+Mount it at `route_prefix: /v1`: `GET /v1/` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers.
+
+- The page is deliberately plain, for trying STT out: Record, then Stop uploads the recording as 16 kHz WAV to `audio/transcriptions` and shows the text, with the language detected. It keeps nothing between visits. A page change redeploys the GPU replica and reloads Whisper, so features belong in the [meeting notes](#meeting-notes) app instead. It uses relative URLs, so open it with the trailing slash (`/v1/`).
 
 `audio/stream` takes 16 kHz mono 16-bit little-endian PCM as binary messages, then `{"type": "stop"}`, with an optional `language` query parameter. It answers with a `segment` event (`start`, `end` in seconds from the first sample, `text`, `language`, `paragraph`, `seconds` spent transcribing) for each piece with text, `error` for a piece that failed (the stream goes on), and `done` after the last piece. While a piece is still going, a `partial` event (`start`, `text`) previews its text about every second of audio, when the GPU is free and no finished piece is waiting; the piece's `segment` has the same `start`, and no partial for a piece comes after it. Previews re-transcribe the piece from its start, so a 15 s piece costs up to 15 extra transcriptions of growing length; on the cluster a 7 s piece took 0.5–0.7 s, so one meeting keeps the GPU about half busy, and finished pieces and HTTP requests go first.
 
@@ -229,7 +231,7 @@ Mount it at its own route prefix, for example `route_prefix: /meeting`, and open
 - Text appears as it is spoken: the piece being spoken shows in grey and is updated about every second, then replaced by its final text when the piece ends. Pieces join into a paragraph until a pause of 2 s or more. The meeting is one WebSocket for its whole length, so nothing queues in the browser; if it drops, recording stops and the transcript so far is kept. Proxies in front of both apps must pass WebSocket upgrades.
 - The transcript is kept in the browser's local storage and can be copied, downloaded as text with a clock time per paragraph, or downloaded as WebVTT subtitles with one cue per piece. It stays until New note clears it, so a reload keeps it; a meeting that is running carries on into the new note.
 - The language menu offers auto-detect and six common languages; Other… takes any language Whisper knows, by name or code, with suggestions from STT's `/health`. The replica reads that list once STT answers; until then the page still loads, and Other… falls back to auto-detect.
-- Only meeting mode moved here. STT's old page also had push-to-talk and hands-free modes, which uploaded single utterances to `audio/transcriptions`; voice chat covers short speech.
+- Only meeting mode moved here. STT's old page also had hands-free and hold-to-talk modes, which uploaded single utterances to `audio/transcriptions`; STT keeps a plain Record/Stop page for that, and voice chat covers short speech too.
 - Like voice chat, it holds no models, so a replica asks for one CPU and no GPU and runs in the system Python. The relay uses the `websockets` client that Ray Serve already installs (through `uvicorn[standard]`).
 - Access control belongs to the deployment in front (in the homelab, OAuth2 Proxy for the page). `MEETING_STT_TOKEN` is only what the replica sends to STT.
 

@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Transcribe</title>
+<style>
+  body { font-family: -apple-system, system-ui, sans-serif; max-width: 760px; margin: 0 auto; padding: 1rem; color: #222; }
+  h1 { font-size: 1.3rem; }
+  #version { font-size: .75rem; font-weight: normal; color: #64748b; }
+  #log { margin: 1rem 0; display: flex; flex-direction: column; gap: .5rem; }
+  .entry { padding: .5rem .75rem; border-radius: .6rem; background: #f1f5f9; white-space: pre-wrap; }
+  .error { color: #b91c1c; }
+  #record { width: 100%; padding: 1.2rem; font-size: 1.1rem; border-radius: .8rem; border: none; background: #2563eb; color: white; }
+  #record.on { background: #dc2626; }
+  #status { font-size: .85rem; color: #475569; margin-top: .5rem; min-height: 1.2em; }
+</style>
+</head>
+<body>
+<h1>Transcribe <span id="version">{{VERSION}}</span></h1>
+<div id="log"></div>
+<button id="record" type="button">Record</button>
+<div id="status"></div>
+<script>
+// Records the microphone until Stop, then uploads it as 16 kHz WAV to audio/transcriptions; the language is detected.
+const $ = id => document.getElementById(id);
+const RATE = 16000, MAX_SECONDS = 290;  // the service takes up to 300 s per upload
+let ctx, frames = null;
+
+async function start() {
+  if (!ctx) {
+    ctx = new AudioContext();
+    const media = await navigator.mediaDevices.getUserMedia({audio: {echoCancellation: true, noiseSuppression: true, channelCount: 1}});
+    const worklet = `registerProcessor('rec', class extends AudioWorkletProcessor {
+      process(inputs) { if (inputs[0][0]) this.port.postMessage(inputs[0][0].slice(0)); return true; } });`;
+    await ctx.audioWorklet.addModule(URL.createObjectURL(new Blob([worklet], {type: 'application/javascript'})));
+    const recorder = new AudioWorkletNode(ctx, 'rec');
+    recorder.port.onmessage = e => {
+      if (!frames) return;
+      frames.push(e.data);
+      if (frames.length * e.data.length >= ctx.sampleRate * MAX_SECONDS) stop();
+    };
+    ctx.createMediaStreamSource(media).connect(recorder);
+  }
+  await ctx.resume();
+  frames = [];
+  $('record').textContent = 'Stop';
+  $('record').classList.add('on');
+  $('status').textContent = 'Recording…';
+}
+
+function wav(frames, rate) {
+  const length = frames.reduce((n, f) => n + f.length, 0), ratio = rate / RATE;
+  const samples = new Float32Array(length);
+  let offset = 0;
+  for (const f of frames) { samples.set(f, offset); offset += f.length; }
+  const n = Math.floor(length / ratio), view = new DataView(new ArrayBuffer(44 + n * 2));
+  const text = (at, s) => [...s].forEach((c, i) => view.setUint8(at + i, c.charCodeAt(0)));
+  text(0, 'RIFF'); view.setUint32(4, 36 + n * 2, true); text(8, 'WAVEfmt ');
+  view.setUint32(16, 16, true); view.setUint16(20, 1, true); view.setUint16(22, 1, true);
+  view.setUint32(24, RATE, true); view.setUint32(28, RATE * 2, true); view.setUint16(32, 2, true); view.setUint16(34, 16, true);
+  text(36, 'data'); view.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {  // each output sample is the mean of the input samples it covers
+    const from = Math.floor(i * ratio), to = Math.max(from + 1, Math.floor((i + 1) * ratio));
+    let sum = 0;
+    for (let j = from; j < to; j++) sum += samples[j];
+    view.setInt16(44 + i * 2, Math.max(-1, Math.min(1, sum / (to - from))) * 0x7fff, true);
+  }
+  return new Blob([view.buffer], {type: 'audio/wav'});
+}
+
+function show(text, className = 'entry') {
+  const div = document.createElement('div');
+  div.className = className;
+  div.textContent = text;
+  $('log').append(div);
+  div.scrollIntoView({block: 'end'});
+}
+
+async function stop() {
+  const recorded = frames;
+  frames = null;
+  $('record').textContent = 'Record';
+  $('record').classList.remove('on');
+  $('status').textContent = 'Transcribing…';
+  const form = new FormData();
+  form.append('file', wav(recorded, ctx.sampleRate), 'speech.wav');
+  try {
+    const res = await fetch('audio/transcriptions', {method: 'POST', body: form});
+    const body = await res.json();
+    if (!res.ok) throw new Error(body.error?.message || res.statusText);
+    if (body.text) show(body.text);
+    $('status').textContent = body.text ? `${body.language} · ${body.duration}s audio` : 'Nothing heard';
+  } catch (err) {
+    show(`Transcription failed: ${err.message}`, 'error');
+    $('status').textContent = '';
+  }
+}
+
+$('record').onclick = async () => {
+  if (frames) { stop(); return; }
+  try { await start(); } catch (err) { $('status').textContent = `Microphone unavailable: ${err.message}`; }
+};
+</script>
+</body>
+</html>
