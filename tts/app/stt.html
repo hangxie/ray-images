@@ -344,7 +344,7 @@ async function startMeeting() {
   if (lang) url.searchParams.set('language', lang);
   const socket = new WebSocket(url);
   // at: when the stream's first sample was recorded; its pieces' times count from there.
-  const m = meeting = {socket, at: null, frames: [], length: 0, item: null, shown: null, stopping: false};
+  const m = meeting = {socket, at: null, frames: [], length: 0, item: null, shown: null, live: null, stopping: false};
   socket.onmessage = e => onMeetingEvent(m, JSON.parse(e.data));
   socket.onclose = e => {
     if (meeting !== m) return;
@@ -383,9 +383,14 @@ function stopMeeting() {
   meetingUi();
 }
 
+function clearLive(m) {
+  if (m.live) { m.live.div.remove(); m.live = null; }
+}
+
 function endMeeting() {
   const m = meeting;
   meeting = null;
+  clearLive(m);
   if (m.socket.readyState === WebSocket.OPEN) m.socket.close();
   if (wakeLock && !handsFree) { wakeLock.release().catch(() => {}); wakeLock = null; }
   meetingUi();
@@ -394,7 +399,15 @@ function endMeeting() {
 function onMeetingEvent(m, event) {
   if (event.type === 'done') { if (meeting === m) endMeeting(); return; }
   if (event.type === 'error') { entry(`Transcription failed: ${event.message}`, clock(Date.now()), 'error'); return; }
+  if (event.type === 'partial') {
+    // The piece still being spoken, previewed in grey at the bottom until its segment arrives.
+    m.live ??= entry('', 'still listening…', 'entry pending');
+    m.live.text.textContent = event.text;
+    m.live.div.scrollIntoView({block: 'end'});
+    return;
+  }
   if (event.type !== 'segment') return;
+  clearLive(m);
   const start = m.at + event.start * 1000, end = m.at + event.end * 1000;
   if (event.paragraph || !m.item) {
     m.item = {at: start, text: '', meta: '', segments: []};

@@ -16,7 +16,8 @@ import serve_stt
 
 
 @pytest.fixture
-def replica():
+def replica(monkeypatch):
+    monkeypatch.setattr(serve_stt, "PARTIAL_SECONDS", 1e9)  # no previews, except in test_stream_previews
     replica = object.__new__(cast(Any, serve_stt.STT).func_or_class)
     replica.model_id = "openai/whisper-tiny"
     replica.device = "CPU / CUDA none"
@@ -306,6 +307,27 @@ def test_stream_transcribes_pieces_with_context(client, replica):
     ]
     # Each piece gets the text so far as its prompt, and the language found in the first.
     assert prompts == [("", None), ("Piece 1.", "fr"), ("Piece 1. Piece 2.", "fr")]
+
+
+def test_stream_previews_the_piece_being_spoken(client, replica, monkeypatch):
+    monkeypatch.setattr(serve_stt, "PARTIAL_SECONDS", 1.0)
+    seen = []
+
+    def transcribe(audio, language, prompt=""):
+        seen.append(audio.size / 16000)
+        return f"{audio.size / 16000:.1f} s.", "en"
+
+    replica.transcribe = transcribe
+    events = stream(client, np.concatenate([speech(8.0), silence(1.0), speech(3.0)]))
+    partials = [e for e in events if e["type"] == "partial"]
+    segments = [e for e in events if e["type"] == "segment"]
+    assert [s["start"] for s in segments] == [0.0, 8.7]
+    assert len(partials) >= 3
+    for p in partials:  # each previews a piece that later ends, and comes before it
+        segment_at = next(i for i, e in enumerate(events) if e["type"] == "segment" and e["start"] == p["start"])
+        assert events.index(p) < segment_at
+    texts = [float(p["text"].split()[0]) for p in partials if p["start"] == 0.0]
+    assert texts == sorted(texts) and texts[-1] < 8.3  # growing previews of the first piece, never past its end
 
 
 def test_stream_language_is_given(client, replica):

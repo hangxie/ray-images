@@ -34,6 +34,7 @@ SAMPLE_RATE = 16_000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # OpenAI's own limit for /v1/audio/transcriptions
 MAX_AUDIO_SECONDS = 300
 WINDOW_FRAMES = 3000  # Whisper's 30 s window in feature frames; longer audio is decoded long-form with timestamps
+PARTIAL_SECONDS = 1.0  # how often a live stream previews the text of the piece it is in
 PROMPT_TOKENS = 160  # previous text kept as Whisper's prompt; Whisper takes at most 223 (half its 448 positions)
 
 logger = logging.getLogger("ray.serve")
@@ -138,6 +139,7 @@ class Segmenter:
         self.floor = self.MIN_FLOOR
         self.last_speech: float | None = None  # stream time where the previous piece's speech ended
         self.peak = 0.0  # the loudest frame so far, for the stream's log line
+        self.cuts = 0  # pieces ended so far, with or without speech
 
     def speech(self, level):
         return level > max(self.MIN_SPEECH_LEVEL, self.floor * 3)
@@ -166,10 +168,20 @@ class Segmenter:
         """The rest of the stream as a last piece, if it has speech."""
         return self.cut(len(self.levels), whole=True)
 
+    def current(self):
+        """The piece so far, trimmed at the front as cut() will, for a preview of its text; None without speech.
+        `cuts` tells whether the piece has ended since."""
+        voiced = [i for i, level in enumerate(self.levels) if self.speech(level)]
+        if len(voiced) < self.min_speech_frames:
+            return None
+        first = max(0, voiced[0] - self.margin_frames) * self.FRAME
+        return {"start": (self.start + first) / SAMPLE_RATE, "audio": self.audio[first:], "cuts": self.cuts}
+
     def cut(self, frames, whole=False):
         end = len(self.audio) if whole else frames * self.FRAME
         audio, levels, start = self.audio[:end], self.levels[:frames], self.start
         self.audio, self.levels, self.start = self.audio[end:], self.levels[frames:], start + end
+        self.cuts += 1
         voiced = [i for i, level in enumerate(levels) if self.speech(level)]
         if len(voiced) < self.min_speech_frames:
             return []
@@ -287,6 +299,10 @@ class STT:
         cuts it with a Segmenter and sends, in order, a `segment` event (start, end, text, language, paragraph,
         seconds) for each piece with text, an `error` event for a piece that failed, and `done` after the last one.
         Each piece gets the text before it as its prompt, and keeps the language of the first piece with text.
+
+        While a piece is still going, about every PARTIAL_SECONDS of audio a `partial` event (start, text) previews
+        its text so far, when the GPU is free and no finished piece is waiting; the piece's `segment`, with the same
+        start, replaces it, and no partial for a piece comes after its segment.
         """
         await websocket.accept()
         try:
@@ -296,16 +312,15 @@ class STT:
             await websocket.close(1008)
             return
         segmenter, pieces = Segmenter(), asyncio.Queue[dict | None]()
-        counts = {"pieces": 0, "segments": 0}
+        state = {"language": language, "context": ""}
+        counts = {"pieces": 0, "segments": 0, "partials": 0}
 
         async def transcriber():
-            nonlocal language
-            context = ""
             while (piece := await pieces.get()) is not None:
                 counts["pieces"] += 1
                 try:
                     started = time.perf_counter()
-                    text, found = await self.run(piece["audio"], language, context)
+                    text, found = await self.run(piece["audio"], state["language"], state["context"])
                     elapsed = time.perf_counter() - started
                 except Exception as exc:
                     logger.exception("Transcription failed")
@@ -313,13 +328,25 @@ class STT:
                     continue
                 if not text:
                     continue
-                language, context = found, f"{context} {text}".strip()[-2000:]
+                state["language"], state["context"] = found, f"{state['context']} {text}".strip()[-2000:]
                 event = {"type": "segment", "start": round(piece["start"], 2), "end": round(piece["end"], 2)}
                 event |= {"text": text, "language": self.languages.get(found, found), "paragraph": piece["paragraph"]}
                 await websocket.send_json({**event, "seconds": round(elapsed, 2)})
                 counts["segments"] += 1
 
+        async def preview(current):
+            try:
+                text, _ = await self.run(current["audio"], state["language"], state["context"])
+            except Exception:
+                logger.exception("Preview failed")
+                return
+            if text and segmenter.cuts == current["cuts"]:  # the piece is still going
+                await websocket.send_json({"type": "partial", "start": round(current["start"], 2), "text": text})
+                counts["partials"] += 1
+
         worker = asyncio.create_task(transcriber())
+        partial: asyncio.Task | None = None
+        previewed = 0  # stream sample of the last preview
         try:
             while True:
                 message = await websocket.receive()
@@ -330,7 +357,15 @@ class STT:
                     samples = np.frombuffer(data[: len(data) // 2 * 2], dtype="<i2").astype(np.float32) / 32768
                     for piece in segmenter.feed(samples):
                         pieces.put_nowait(piece)
+                    received = segmenter.start + len(segmenter.audio)
+                    idle = (partial is None or partial.done()) and pieces.empty() and not self.gpu.locked()
+                    if idle and received - previewed >= PARTIAL_SECONDS * SAMPLE_RATE:
+                        previewed = received
+                        if (current := segmenter.current()) is not None:
+                            partial = asyncio.create_task(preview(current))
                 elif control(message.get("text") or "") == "stop":
+                    if partial is not None:
+                        partial.cancel()
                     for piece in segmenter.flush():
                         pieces.put_nowait(piece)
                     pieces.put_nowait(None)
@@ -342,11 +377,14 @@ class STT:
             logger.exception("Live transcription failed")
         finally:
             worker.cancel()
+            if partial is not None:
+                partial.cancel()
             logger.info(
-                "Stream ended: %.1f s of audio, %d pieces, %d with text, peak %.1f dBFS, noise floor %.1f dBFS",
+                "Stream ended: %.1f s of audio, %d pieces, %d with text, %d previews, peak %.1f dBFS, floor %.1f dBFS",
                 (segmenter.start + len(segmenter.audio)) / SAMPLE_RATE,
                 counts["pieces"],
                 counts["segments"],
+                counts["partials"],
                 20 * np.log10(segmenter.peak + 1e-9),
                 20 * np.log10(segmenter.floor),
             )

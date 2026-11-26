@@ -12,7 +12,7 @@ function element(id) {
       toggle(c, on) { on ? this.set.add(c) : this.set.delete(c); }, add(c) { this.set.add(c); }, remove(c) { this.set.delete(c); },
     },
     append(...c) { this.children.push(...c); }, replaceChildren(...c) { this.children = c; },
-    scrollIntoView() {}, focus() { document.activeElement = this; }, remove() {},
+    scrollIntoView() {}, focus() { document.activeElement = this; }, remove() { this.removed = true; },
     addEventListener(type, fn) { this['on' + type] = fn; },
     get firstChild() { return this.children[0]; },
   };
@@ -88,7 +88,12 @@ const deliver = (socket, event) => socket.onmessage({data: JSON.stringify(event)
   // 41 frames go once the socket is open, then 38 at the next 0.1 s; the last one waits.
   check(pcm.length === 2 && samples === Math.floor(41 * 128 / 3) + Math.floor(38 * 128 / 3) && pcm[0][0] === Math.trunc(0.1 * 0x7fff),
     `frames go out as 16 kHz PCM (${samples} samples in ${pcm.length} messages)`);
+  deliver(socket, {type: 'partial', start: 0, text: '你'});
+  deliver(socket, {type: 'partial', start: 0, text: '你好'});
+  const live = $('log').children.filter(c => c.className === 'entry pending');
+  check(live.length === 1 && live[0].firstChild.textContent === '你好', 'partials update one grey line');
   deliver(socket, {type: 'segment', start: 0, end: 5, text: '你好', language: 'chinese', paragraph: true, seconds: 0.4});
+  check(live[0].removed, 'the segment replaces the partial');
   deliver(socket, {type: 'segment', start: 5, end: 9, text: '世界', language: 'chinese', paragraph: false, seconds: 0.3});
   deliver(socket, {type: 'segment', start: 12, end: 14, text: 'Next.', language: 'chinese', paragraph: true, seconds: 0.3});
   const saved = JSON.parse(storage.transcript);
