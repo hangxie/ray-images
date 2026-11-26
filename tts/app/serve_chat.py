@@ -11,6 +11,7 @@ the client-IP allowlist, which is gone: access control belongs to the deployment
 import asyncio
 import base64
 import contextlib
+import html
 import http.client
 import json
 import logging
@@ -31,6 +32,7 @@ from ray import serve
 from starlette.exceptions import HTTPException
 
 ROOT = Path(__file__).resolve().parent
+VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
 SYSTEM_PROMPT = (
     "You are a friendly voice assistant in a spoken conversation. Reply in the language the user speaks. "
     "Keep answers brief, one to three short sentences, unless asked for more detail. "
@@ -474,7 +476,8 @@ class Chat:
 
     @api.get("/")
     def page(self):
-        return reply(200, (ROOT / "chat.html").read_bytes(), "text/html; charset=utf-8")
+        page = (ROOT / "chat.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
+        return reply(200, page.encode(), "text/html; charset=utf-8")
 
     @api.get("/health")
     def health(self):
@@ -483,6 +486,7 @@ class Chat:
             200,
             {
                 "status": "ok",
+                "version": VERSION,
                 "stt": c["stt_url"],
                 "llm": c["llm_url"],
                 "llm_model": c["llm_model"],
