@@ -9,7 +9,8 @@
   header { display: flex; gap: .75rem; align-items: center; flex-wrap: wrap; position: sticky; top: 0; z-index: 1; background: white; padding: .5rem 0; border-bottom: 1px solid #e2e8f0; }
   h1 { font-size: 1.3rem; margin: 0 auto 0 0; }
   #version { font-size: .75rem; font-weight: normal; color: #64748b; }
-  #language { width: 7rem; }
+  #language-other { width: 8rem; }
+  #language-other.invalid { border-color: #dc2626; outline-color: #dc2626; background: #fef2f2; }
   #log { margin: 1rem 0; display: flex; flex-direction: column; gap: .5rem; min-height: 40vh; }
   .entry { padding: .5rem .75rem; border-radius: .6rem; background: #f1f5f9; white-space: pre-wrap; }
   .entry.pending { color: #64748b; font-style: italic; }
@@ -29,8 +30,18 @@
 <body>
 <header>
   <h1>Transcribe <span id="version">{{VERSION}}</span></h1>
-  <label>Language <input id="language" placeholder="auto" list="languages" autocomplete="off"></label>
-  <datalist id="languages"><option value="english"><option value="chinese"><option value="japanese"><option value="korean"><option value="french"><option value="german"><option value="spanish"></datalist>
+  <label>Language <select id="language">
+    <option value="">Auto-detect</option>
+    <option value="english">English</option>
+    <option value="chinese">Chinese</option>
+    <option value="spanish">Spanish</option>
+    <option value="french">French</option>
+    <option value="korean">Korean</option>
+    <option value="japanese">Japanese</option>
+    <option value="other">Other…</option>
+  </select></label>
+  <input id="language-other" placeholder="type a language" list="languages" autocomplete="off" hidden aria-label="Other language">
+  <datalist id="languages"></datalist>
   <button id="handsfree" type="button">Hands-free: off</button>
   <button id="meeting" type="button">Meeting: off</button>
 </header>
@@ -89,8 +100,39 @@ function entry(text, meta, className = 'entry') {
   return {div, text: div.firstChild, meta: small};
 }
 
-$('language').value = localStorage.getItem('language') || '';
-$('language').onchange = () => localStorage.setItem('language', $('language').value.trim());
+// Whisper's languages, English name (and aliases such as mandarin) -> code, filled in by the server.
+const LANGUAGE_CODES = {{LANGUAGES}};
+const KNOWN = new Set([...Object.keys(LANGUAGE_CODES), ...Object.values(LANGUAGE_CODES)]);
+$('languages').replaceChildren(...Object.keys(LANGUAGE_CODES).sort().map(name => new Option(name)));
+
+// The language sent with each request: '' (auto-detect) for Auto, or for Other when Whisper doesn't know it.
+function language() {
+  if ($('language').value !== 'other') return $('language').value;
+  const typed = $('language-other').value.trim().toLowerCase();
+  return KNOWN.has(typed) ? typed : '';
+}
+function checkLanguage() {
+  const other = $('language').value === 'other', typed = $('language-other').value.trim().toLowerCase();
+  $('language-other').hidden = !other;
+  const invalid = other && !!typed && !KNOWN.has(typed);
+  $('language-other').classList.toggle('invalid', invalid);
+  if (invalid) status(`Whisper doesn't know “${typed}”; using auto-detect until it is fixed.`);
+  else idleStatus();
+}
+function saveLanguage() {
+  localStorage.setItem('language', $('language').value === 'other' ? $('language-other').value.trim() : $('language').value);
+  checkLanguage();
+}
+{
+  // Older pages saved free text; a preset name selects its entry, anything else goes to Other.
+  const saved = (localStorage.getItem('language') || '').toLowerCase();
+  const preset = [...$('language').options].find(o => o.value && o.value !== 'other' && (o.value === saved || LANGUAGE_CODES[o.value] === saved));
+  $('language').value = preset ? preset.value : saved ? 'other' : '';
+  if (!preset && saved) $('language-other').value = saved;
+  checkLanguage();
+}
+$('language').onchange = () => { saveLanguage(); if ($('language').value === 'other') $('language-other').focus(); };
+$('language-other').oninput = saveLanguage;
 
 async function start() {
   ctx = ctx || new AudioContext();
@@ -249,11 +291,11 @@ function endUtterance(keep, shortMessage) {
   for (const f of frames) { samples.set(f, offset); offset += f.length; }
   frames = [];
   const rate = Math.min(ctx.sampleRate, TARGET_RATE);
-  const wav = wavBlob(downsample(samples, ctx.sampleRate), rate), at = startedAt, language = $('language').value.trim();
+  const wav = wavBlob(downsample(samples, ctx.sampleRate), rate), at = startedAt;
   const shown = entry('Transcribing…', clock(at), 'entry pending');
   pending++;
   idleStatus();
-  queue = queue.then(() => transcribe(wav, at, language, shown)).finally(() => { pending--; idleStatus(); });
+  queue = queue.then(() => transcribe(wav, at, language(), shown)).finally(() => { pending--; idleStatus(); });
 }
 
 async function transcribe(wav, at, language, shown) {
@@ -297,9 +339,9 @@ async function startMeeting() {
   await ctx.resume();
   if (handsFree) await toggleHandsFree();
   if (recording) endUtterance(true, '');
-  const url = new URL('audio/stream', location.href), language = $('language').value.trim();
+  const url = new URL('audio/stream', location.href), lang = language();
   url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  if (language) url.searchParams.set('language', language);
+  if (lang) url.searchParams.set('language', lang);
   const socket = new WebSocket(url);
   // at: when the stream's first sample was recorded; its pieces' times count from there.
   const m = meeting = {socket, at: null, frames: [], length: 0, item: null, shown: null, stopping: false};
@@ -410,8 +452,10 @@ $('talk').addEventListener('pointerdown', e => { e.preventDefault(); pressTalk()
 $('talk').addEventListener('pointerup', releaseTalk);
 $('talk').addEventListener('pointercancel', releaseTalk);
 $('talk').addEventListener('pointerleave', releaseTalk);
-document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && document.activeElement !== $('language')) { e.preventDefault(); pressTalk(); } });
-document.addEventListener('keyup', e => { if (e.code === 'Space' && document.activeElement !== $('language')) releaseTalk(); });
+// Space talks, except while typing a language or choosing one.
+const typing = () => ['INPUT', 'SELECT'].includes(document.activeElement?.tagName);
+document.addEventListener('keydown', e => { if (e.code === 'Space' && !e.repeat && !typing()) { e.preventDefault(); pressTalk(); } });
+document.addEventListener('keyup', e => { if (e.code === 'Space' && !typing()) releaseTalk(); });
 $('handsfree').onclick = toggleHandsFree;
 $('meeting').onclick = () => (meeting ? stopMeeting() : startMeeting());
 for (const e of transcript) entry(e.text, e.meta);

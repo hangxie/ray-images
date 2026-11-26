@@ -227,6 +227,9 @@ class STT:
     @api.get("/")
     def page(self):
         page = (ROOT / "stt.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
+        page = page.replace(
+            "{{LANGUAGES}}", json.dumps(self.language_codes, sort_keys=True)
+        )  # Whisper's, for the picker
         return reply(200, page.encode(), "text/html; charset=utf-8")
 
     @api.get("/health")

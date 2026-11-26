@@ -183,6 +183,19 @@ def test_page_uses_relative_urls(client):
     assert f'<span id="version">{serve_stt.VERSION}</span>' in response.text
 
 
+def test_page_language_picker_knows_whispers_languages(client):
+    import re
+
+    page = client.get("/").text
+    found = re.search(r"const LANGUAGE_CODES = (\{.*?\});", page)
+    assert found
+    codes = json.loads(found.group(1))
+    assert codes == TO_LANGUAGE_CODE and codes["mandarin"] == "zh"
+    presets = re.findall(r'<option value="([a-z]+)">', page)
+    assert presets == ["english", "chinese", "spanish", "french", "korean", "japanese", "other"]
+    assert all(p in codes for p in presets[:-1])  # each preset is a name the server accepts
+
+
 def speech(seconds, amplitude=0.1):
     """A tone in 0.2 s syllables with 0.06 s dips to a tenth between them, as speech has."""
     audio = tone(seconds=seconds, rate=16000, amplitude=amplitude)
