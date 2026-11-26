@@ -91,11 +91,13 @@ def test_page(client):
     assert response.headers["content-type"] == "text/html; charset=utf-8"
     assert response.headers["cache-control"] == "no-store"
     assert b"<html" in response.content.lower()
+    assert f'<span id="version">{serve_tts.VERSION}</span>' in response.text
 
 
 def test_health(client):
     body = client.get("/health").json()
     assert body["status"] == "ok"
+    assert body["version"] == serve_tts.VERSION
     assert body["model"] == "Qwen/tiny"
     assert body["languages"] == ["auto", "chinese", "english"]
     assert body["sampling"]["top_k"] == {"default": 50, "min": 0, "max": 1024, "integer": True}

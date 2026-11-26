@@ -13,6 +13,7 @@ import logging
 import os
 import time
 from math import gcd
+from pathlib import Path
 from typing import cast
 
 import numpy as np
@@ -22,6 +23,8 @@ from fastapi.responses import JSONResponse, Response
 from ray import serve
 from starlette.exceptions import HTTPException
 
+ROOT = Path(__file__).resolve().parent
+VERSION = (ROOT / "VERSION").read_text().strip() if (ROOT / "VERSION").exists() else "dev"  # written by the image build
 SAMPLE_RATE = 16_000
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # OpenAI's own limit for /v1/audio/transcriptions
 MAX_AUDIO_SECONDS = 300
@@ -119,7 +122,7 @@ class STT:
 
     @api.get("/health")
     def health(self):
-        return reply(200, {"status": "ok", "model": self.model_id, "device": self.device})
+        return reply(200, {"status": "ok", "version": VERSION, "model": self.model_id, "device": self.device})
 
     @api.get("/models")
     def models(self):
