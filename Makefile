@@ -12,7 +12,7 @@ VERSION := $(shell git describe --tags --always)
 .NOTPARALLEL:
 
 .PHONY: all
-all: dev format lint test pins build  ## Build all common targets and the image
+all: dev format lint test build  ## Build all common targets and both images
 
 .PHONY: dev
 dev:  ## Install the development environment (.venv) from uv.lock
@@ -47,22 +47,29 @@ test:  ## Run unit tests (CPU)
 	@echo "==> Running unit tests"
 	@uv run --locked pytest
 
-.PHONY: pins
-pins:  ## Check the dev environment against vLLM's pins on PyPI
-	@echo "==> Checking pins against vLLM on PyPI"
-	@uv run --locked pytest -m network
-
 .PHONY: check
-check: lint test  ## Lint and test, offline (CI runs this and pins)
+check: lint test  ## Lint and test (CI runs this)
 
 .PHONY: build
-build:  ## build hangxie/ray-images
+build: build-vllm build-voice  ## Build both images, tagged $(VERSION)
+
+# docker/<image>/Dockerfile, built from the repository root, as hangxie/ray-<image>:$(VERSION)
+define build_image
 	docker build . \
-		-f Dockerfile \
+		-f docker/$(1)/Dockerfile \
 		--platform linux/amd64 \
 		--build-arg VERSION=$(VERSION) \
 		--label org.opencontainers.image.version=$(VERSION) \
-		-t hangxie/ray-images:$(VERSION)
+		-t hangxie/ray-$(1):$(VERSION)
+endef
+
+.PHONY: build-vllm
+build-vllm:  ## Build hangxie/ray-vllm (vLLM)
+	$(call build_image,vllm)
+
+.PHONY: build-voice
+build-voice:  ## Build hangxie/ray-voice (TTS, STT, voice chat, meeting notes)
+	$(call build_image,voice)
 
 .PHONY: clean
 clean:  ## clean up temporary files

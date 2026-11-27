@@ -1,36 +1,39 @@
 # ray-images
 
-Ray image for the homelab cluster, published as `hangxie/ray-images:<tag>`. It contains Ray with vLLM for LLM serving, plus a Qwen3-TTS voice-cloning Ray Serve app (see [TTS](#tts)), a Whisper speech-to-text Ray Serve app (see [STT](#stt)), a voice chat app that drives them and an LLM (see [Voice chat](#voice-chat)), and a meeting notes app that transcribes a meeting live through STT (see [Meeting notes](#meeting-notes)).
+Ray images for the homelab cluster, built from this repo and tagged together:
 
-The head, LLM workers, and TTS workers all run this one image, so the Ray version and the Serve app code always match across the cluster.
+- `hangxie/ray-vllm:<tag>`: Ray with vLLM for LLM serving (see [vLLM](#vllm)).
+- `hangxie/ray-voice:<tag>`: Ray with the Serve apps: Qwen3-TTS voice cloning (see [TTS](#tts)), Whisper speech-to-text (see [STT](#stt)), a voice chat app that drives them and an LLM (see [Voice chat](#voice-chat)), and meeting notes that transcribe a meeting live through STT (see [Meeting notes](#meeting-notes)).
+
+Each app runs in its own Ray cluster, whose head and workers all use one image, and the apps talk to each other over HTTP. So the LLM and the voice apps don't need to share an image, and they don't: `qwen-tts==0.1.1` pins `transformers==4.57.3`, while vLLM 0.27.0 needs `transformers>=5.5.3`. Apart, each image has one Python environment where `pip check` passes, the voice image carries no vLLM or FlashInfer, and a vLLM upgrade doesn't rebuild or re-validate TTS and STT.
 
 ```text
-Dockerfile                  the image
+docker/vllm/Dockerfile      hangxie/ray-vllm
+docker/voice/Dockerfile     hangxie/ray-voice
 scripts/                    build-time helpers (FlashInfer cache pruning)
 serve/tts/                  TTS Serve app (serve_tts.py, cuda_graphs.py, index.html), importable as serve_tts:app
 serve/stt/                  STT Serve app (serve_stt.py, stt.html), importable as serve_stt:app
 serve/chat/                 voice chat Serve app (serve_chat.py, chat.html), importable as serve_chat:app
 serve/meeting/              meeting notes Serve app (serve_meeting.py, meeting.html), importable as serve_meeting:app
 serve/common/               code the Serve apps share (caller_log.py)
-serve/check_requirements.py build-time dependency check for the voice virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
 ```
 
 ```bash
-make dev      # development environment in .venv (needs uv)
-make check    # ruff format/lint, mypy, Markdown rules, tests
-make build
-docker inspect -f '{{json .Config.Labels}}' hangxie/ray-images:<tag>
+make dev                # development environment in .venv (needs uv)
+make check              # ruff format/lint, mypy, Markdown rules, tests
+make build              # both images; make build-vllm or make build-voice for one
+docker inspect -f '{{json .Config.Labels}}' hangxie/ray-voice:<tag>
 ```
 
-Image tags are this repo's own `vX.Y.Z`, with `vX.Y.Z-rcN` for release candidates. Upstream versions are `ARG`s in the `Dockerfile`, recorded as `io.github.hangxie.ray-images.*` labels.
+Image tags are this repo's own `vX.Y.Z`, with `vX.Y.Z-rcN` for release candidates; one git tag releases both images, and the release notes say which one changed. Both Dockerfiles build from the repository root. Upstream versions are `ARG`s in each Dockerfile, recorded as `io.github.hangxie.ray-images.*` labels.
 
-Images up to `v0.3.0` were published as `hangxie/ray-vllm` and use the `io.github.hangxie.ray-vllm.` label prefix.
+Until `v0.11.0`, one image held both, published as `hangxie/ray-images` (and up to `v0.3.0` as `hangxie/ray-vllm`, with the `io.github.hangxie.ray-vllm.` label prefix).
 
 ## Development
 
-`pyproject.toml` and `uv.lock` define a development environment for linting and tests only; the image is still built with pip from the `Dockerfile`. The environment mirrors the voice virtualenv (Ray, the torch/torchaudio/fastapi versions vLLM pins, qwen-tts with transformers 4.57.3), so keep its pins in step with the `Dockerfile` when upgrading.
+`pyproject.toml` and `uv.lock` define a development environment for linting and tests only; the images are still built with pip from their Dockerfiles. The environment mirrors the voice image (Ray, torch, torchaudio, qwen-tts with transformers 4.57.3), so keep its pins in step with `docker/voice/Dockerfile` when upgrading; `tests/test_pins.py` fails when they drift.
 
 Most of the code needs a GPU, so the tests run what they can on CPU: the HTTP APIs and request validation against fake models, audio post-processing, and, with tiny random qwen-tts models, the generation hooks, CUDA-graph decoding bodies (eager on CPU) against HF `generate`, and streamed decoding against the full-clip decode. Model loading, CUDA graph capture, and real synthesis are still validated on the cluster. CI runs `make check` on every push and pull request.
 
@@ -56,7 +59,7 @@ FlashInfer's CUDA 13.0 JIT-cache wheel is included, so the default sampler loads
 Smoke test on a GPU host, with the nvcc fallback disabled:
 
 ```bash
-docker run --rm --gpus all -e FLASHINFER_DISABLE_JIT=1 hangxie/ray-images:<tag> \
+docker run --rm --gpus all -e FLASHINFER_DISABLE_JIT=1 hangxie/ray-vllm:<tag> \
   python3 -c "import torch; from flashinfer.sampling import top_k_top_p_sampling_from_probs; p = torch.full((4, 128), 1 / 128, device='cuda'); s = top_k_top_p_sampling_from_probs(p, 16, 0.9); torch.cuda.synchronize(); assert s.shape == (4,) and ((s >= 0) & (s < 128)).all().item(); print('FlashInfer sampler OK')"
 ```
 
@@ -81,15 +84,9 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 
 `serve_tts:app` runs Qwen3-TTS Base voice cloning as a Ray Serve application on CUDA. It ports site-up's `ai/mlx-voice-svc` (MLX, Apple Silicon only) to the official PyTorch package [`qwen-tts`](https://pypi.org/project/qwen-tts/).
 
-### Python environments
+### Python environment
 
-`qwen-tts==0.1.1` pins `transformers==4.57.3`, but vLLM 0.27.0 needs `transformers>=5.5.3`. TTS therefore gets its own virtualenv at `/home/ray/voice-venv`, which STT shares (see [STT](#stt)).
-
-- The venv is created with `--system-site-packages`. It reuses the image's Ray, torch, torchaudio, and CUDA libraries, and adds only transformers 4.57.3 and qwen-tts's other dependencies (about 0.4 GB).
-- TTS and STT replicas start with the venv's interpreter, through Ray's `runtime_env` `py_executable`.
-- Everything else, including the head that builds the app, uses the system Python.
-
-`pip check` passes for the system environment. Inside the venv it always reports vLLM's transformers requirement, so the build runs `serve/check_requirements.py` there instead. It checks every qwen-tts requirement as the venv resolves it.
+TTS and STT run in the voice image's system Python. Its torch and torchaudio are the versions vLLM 0.27.0 pinned when the apps shared vLLM's image (2.13.0 and 2.11.0, CUDA 13), which is what the cluster validated; they are `ARG`s now and can move on their own. Everything is installed against those pins so no package replaces them, and `pip check` passes.
 
 `gradio` is only used by the qwen-tts demo, but it stays installed because qwen-tts declares it.
 
@@ -115,14 +112,11 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 | `TTS_VOICES_DIR` | `/home/ray/serve/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
 | `TTS_NUM_REPLICAS` | `2` | Replicas, one GPU each |
 | `TTS_MAX_QUEUED_REQUESTS` | `4` | Requests Serve queues before answering 503 |
-| `TTS_PYTHON` | `/home/ray/voice-venv/bin/python` | Interpreter for TTS replicas (`py_executable`) |
 | `TTS_CUDA_GRAPHS` | `1` | `0` turns off CUDA-graph decoding (see [Decoding speed](#decoding-speed)) |
 | `TTS_KV_CACHE_TOKENS` | `3072` | Talker KV cache size for CUDA-graph decoding, in codec tokens including the prompt |
 | `TTS_STREAM_CONTEXT_FRAMES` | `300` | Frames of reference plus speech the decoder transformer sees per streamed piece |
 
 Set these in the application's `runtime_env` `env_vars`. They are read where Serve builds the app (the head) and passed to the replicas as `TTS.bind()` arguments.
-
-A deployment's `runtime_env` replaces the application's instead of merging with it, so the replica process does not see the application's `env_vars`. The TTS deployment's `runtime_env` therefore carries the head's `HF_*` variables (for example `HF_HUB_OFFLINE`) along with `py_executable`.
 
 ### Deployment
 
@@ -172,7 +166,7 @@ A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`s
 
 ## STT
 
-`serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It runs in the voice virtualenv, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
+`serve_stt:app` serves Whisper (`openai/whisper-large-v3-turbo` by default) through transformers on CUDA with OpenAI's transcription API. It ports site-up's `ai/mlx-stt-svc`, so clients such as site-up's voice chat only change their STT URL. It shares the voice image with TTS, whose transformers 4.57.3, soundfile, and scipy already cover transcription; the live stream adds only `silero-vad` (a 7 MB wheel needing only torch).
 
 The routes carry `/v1` themselves, as `mlx-stt-svc`'s do, so mount it at `route_prefix: /` on its own host (or at any prefix, such as `/stt`): `GET /` (page), `POST /v1/audio/transcriptions`, `WS /v1/audio/stream`, `GET /v1/models`, `GET /v1/health`. `/v1/health` also lists Whisper's languages (`languages`, English name or alias to code), which the [meeting notes](#meeting-notes) page offers.
 
@@ -196,7 +190,6 @@ The routes carry `/v1` themselves, as `mlx-stt-svc`'s do, so mount it at `route_
 | `STT_NUM_REPLICAS` | `1` | Replicas, one GPU each |
 | `STT_MAX_ONGOING_REQUESTS` | `16` | Requests and streams a replica takes at once; transcription itself runs one at a time |
 | `STT_MAX_QUEUED_REQUESTS` | `8` | Requests Serve queues before answering 503 |
-| `STT_PYTHON` | `/home/ray/voice-venv/bin/python` | Interpreter for STT replicas (`py_executable`) |
 
 ## Voice chat
 

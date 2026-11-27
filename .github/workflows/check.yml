@@ -1,4 +1,4 @@
-# Lint and the CPU test suite. The image itself is built and validated on the homelab cluster (AGENTS.md).
+# Lint and the CPU test suite. The images themselves are built and validated on the homelab cluster (AGENTS.md).
 name: check
 
 on:
@@ -19,4 +19,3 @@ jobs:
           enable-cache: true
       - run: make dev
       - run: make check
-      - run: make pins

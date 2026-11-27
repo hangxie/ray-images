@@ -1,5 +1,6 @@
-"""What the head needs from the Serve apps: it imports them with the system Python (no qwen-tts, transformers 5.x),
-reads settings there and passes them through bind(), and pickles the FastAPI app."""
+"""What the head needs from the Serve apps: it imports them to build the applications, reads settings there and passes
+them through bind(), and pickles the FastAPI app. The model packages load only in TTS and STT replicas, so the head and
+the CPU-only chat and meeting replicas never import them."""
 
 import os
 import subprocess
@@ -48,7 +49,7 @@ print(serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app)
 
 
 def test_apps_import_without_replica_packages():
-    """Module-level imports stay within what the system environment has (AGENTS.md, Serve app imports)."""
+    """Module-level imports leave the model packages to the replica (AGENTS.md, Serve app imports)."""
     code = HEAD.format(blocked=REPLICA_ONLY)
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(map(str, APPS))}  # as the image sets it
     result = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
@@ -103,41 +104,23 @@ def test_stt_settings(monkeypatch):
     assert serve_stt.settings() == {"model": "openai/whisper-large-v3-turbo", "model_dir": "/models/whisper"}
 
 
-@pytest.mark.parametrize(("module", "variable"), [(serve_tts, "TTS_PYTHON"), (serve_stt, "STT_PYTHON")])
-def test_replica_runtime_env(monkeypatch, module, variable):
-    """A deployment's runtime_env replaces the application's, so HF_* variables are carried over explicitly."""
-    for name in [n for n in os.environ if n.startswith("HF_")]:
-        monkeypatch.delenv(name)
-    monkeypatch.delenv(variable, raising=False)
-    assert module.replica_runtime_env() == {"py_executable": "/home/ray/voice-venv/bin/python"}
-
-    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
-    monkeypatch.setenv("HF_HOME", "/cache")
-    monkeypatch.setenv("TRANSFORMERS_VERBOSITY", "info")
-    monkeypatch.setenv(variable, "/venv/bin/python")
-    assert module.replica_runtime_env() == {
-        "py_executable": "/venv/bin/python",
-        "env_vars": {"HF_HUB_OFFLINE": "1", "HF_HOME": "/cache"},
-    }
-
-
 def test_tts_deployment_options():
     deployment = cast(Any, serve_tts.TTS)
     assert deployment.ray_actor_options["num_gpus"] == 1
     assert deployment.ray_actor_options["resources"] == {"tts": 1}
-    assert "py_executable" in deployment.ray_actor_options["runtime_env"]
+    assert "runtime_env" not in deployment.ray_actor_options  # one environment: replicas use the application's
     assert deployment.max_ongoing_requests == 1  # one synthesis per replica; the job slot relies on it
 
 
 def test_stt_deployment_options():
     deployment = cast(Any, serve_stt.STT)
     assert deployment.ray_actor_options["num_gpus"] == 1
-    assert "py_executable" in deployment.ray_actor_options["runtime_env"]
+    assert "runtime_env" not in deployment.ray_actor_options
     assert deployment.max_ongoing_requests == 16  # each open stream is one ongoing request; a lock serialises the GPU
 
 
 def test_chat_deployment_options():
-    """Chat holds no model: no GPU, and the system Python (no py_executable), like the head."""
+    """Chat holds no model: no GPU."""
     deployment = cast(Any, serve_chat.Chat)
     assert not deployment.ray_actor_options.get("num_gpus")
     assert "runtime_env" not in deployment.ray_actor_options
