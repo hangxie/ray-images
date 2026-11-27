@@ -11,6 +11,7 @@ serve/tts/                  TTS Serve app (serve_tts.py, cuda_graphs.py, index.h
 serve/stt/                  STT Serve app (serve_stt.py, stt.html), importable as serve_stt:app
 serve/chat/                 voice chat Serve app (serve_chat.py, chat.html), importable as serve_chat:app
 serve/meeting/              meeting notes Serve app (serve_meeting.py, meeting.html), importable as serve_meeting:app
+serve/common/               code the Serve apps share (caller_log.py)
 serve/check_requirements.py build-time dependency check for the voice virtualenv
 tests/                      CPU test suite (pytest)
 pyproject.toml, uv.lock     development environment (uv), ruff, mypy and pytest settings
@@ -102,6 +103,7 @@ python3 -c "from vllm import LLM; LLM(model='s3://<bucket>/<model>', load_format
 - The page retries a 503 the way it retried the old 409.
 - `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
 - Neither TTS nor STT authenticates: both serve plain HTTP (and STT's WebSocket) and ignore `Authorization`. The deployment provides login and API tokens in front of them (in the homelab, OAuth2 Proxy for the page and a bearer check at the Gateway for the APIs).
+- Every app logs the caller of a request that carries `X-Consumer` (the Gateway's bearer check) or an email from OAuth2 Proxy (`X-Auth-Request-Email` as a Gateway auth check, else `X-Forwarded-Email` as a reverse proxy, as in front of the TTS page): one `ray.serve` line with the method, path, status (or `accepted`/`refused` for a WebSocket, `failed` for an exception), seconds, and those values. Requests without them appear only in Serve's access log. `Authorization` is never read or logged. The headers are trusted as they arrive, so the proxy in front must set or strip them. Voice chat and meeting notes don't forward the browser user to STT and TTS: their calls are logged under the identity their own token gets (in the homelab, `consumer=ray-vchat`), and the user under chat's or meeting's own line.
 
 ### Settings
 

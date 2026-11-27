@@ -4,6 +4,7 @@ Everything but Whisper is real: the meeting routes, the websockets client, uvico
 """
 
 import json
+import logging
 import re
 import socket
 import threading
@@ -217,3 +218,26 @@ def test_page_leaving_closes_the_stt_stream(client, stt):
             break
         time.sleep(0.01)
     assert stt.finished == ["/v1/audio/stream"]
+
+
+CALLER = {"X-Consumer": "svc", "X-Auth-Request-Email": "a@example.com", "Authorization": "Bearer secret"}
+
+
+def caller_lines(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "ray.serve" and r.getMessage().endswith(" email=a@example.com")
+    ]
+
+
+def test_caller_is_logged(client, caplog):
+    caplog.set_level(logging.INFO, "ray.serve")
+    assert client.get("/health", headers=CALLER).status_code == 200
+    with client.websocket_connect("/api/stream", headers=CALLER) as ws:
+        ws.send_text(json.dumps({"type": "stop"}))
+        assert ws.receive_json() == {"type": "done"}
+    health, stream = caller_lines(caplog)
+    assert health.startswith("GET /health 200 ") and health.endswith(" consumer=svc email=a@example.com")
+    assert stream.startswith("WS /api/stream accepted ")
+    assert "secret" not in caplog.text

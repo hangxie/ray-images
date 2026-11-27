@@ -82,16 +82,17 @@ RUN python3 -m venv --system-site-packages /home/ray/voice-venv \
     && pip check \
     && rm -rf /home/ray/.cache /tmp/* /var/tmp/*
 
-# The Serve apps, one directory each under /home/ray/serve, all on PYTHONPATH so they stay importable as serve_tts:app,
-# serve_stt:app, serve_chat:app and serve_meeting:app: the head builds them with the system Python; TTS and STT replicas
-# run in the venv, chat and meeting replicas in the system Python.
+# The Serve apps, one directory each under /home/ray/serve, and common/ (code they share), all on PYTHONPATH so they
+# stay importable as serve_tts:app, serve_stt:app, serve_chat:app and serve_meeting:app: the head builds them with the
+# system Python; TTS and STT replicas run in the venv, chat and meeting replicas in the system Python.
 # pyarrow (from the base image, unused here) is blocked for the checks because its native library segfaults under
 # amd64 emulation on Apple Silicon; ray.serve and qwen_tts import fine without it.
+COPY --chown=ray:users serve/common/ /home/ray/serve/common/
 COPY --chown=ray:users serve/tts/ /home/ray/serve/tts/
 COPY --chown=ray:users serve/stt/ /home/ray/serve/stt/
 COPY --chown=ray:users serve/chat/ /home/ray/serve/chat/
 COPY --chown=ray:users serve/meeting/ /home/ray/serve/meeting/
-ENV PYTHONPATH=/home/ray/serve/tts:/home/ray/serve/stt:/home/ray/serve/chat:/home/ray/serve/meeting${PYTHONPATH:+:${PYTHONPATH}}
+ENV PYTHONPATH=/home/ray/serve/common:/home/ray/serve/tts:/home/ray/serve/stt:/home/ray/serve/chat:/home/ray/serve/meeting${PYTHONPATH:+:${PYTHONPATH}}
 RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, serve_stt, serve_chat, serve_meeting, transformers; print('Serve apps:', serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app, 'system transformers', transformers.__version__)" \
     && /home/ray/voice-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts, serve_stt, silero_vad; silero_vad.load_silero_vad(); assert transformers.__version__ == '4.57.3', transformers.__version__; print('Voice venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
 

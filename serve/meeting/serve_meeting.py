@@ -23,6 +23,8 @@ from starlette.exceptions import HTTPException
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed, InvalidHandshake
 
+from caller_log import CallerLog
+
 ROOT = Path(__file__).resolve().parent
 VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
 VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
@@ -34,6 +36,7 @@ MAX_EVENT_BYTES = 1024 * 1024  # STT's events are small JSON objects
 
 logger = logging.getLogger("ray.serve")
 api = FastAPI()
+api.add_middleware(CallerLog)
 
 
 @api.exception_handler(HTTPException)

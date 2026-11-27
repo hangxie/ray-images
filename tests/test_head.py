@@ -16,7 +16,7 @@ import serve_stt
 import serve_tts
 
 SERVE = Path(__file__).resolve().parent.parent / "serve"
-APPS = [SERVE / name for name in ("tts", "stt", "chat", "meeting")]
+APPS = [SERVE / name for name in ("common", "tts", "stt", "chat", "meeting")]
 REPLICA_ONLY = [
     "torch",
     "torchaudio",
