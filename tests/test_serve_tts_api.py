@@ -262,11 +262,12 @@ def test_prompts_are_cached_until_files_change(client, replica, voices_dir):
     assert prompts[-1] == ("prompt", str(voices_dir / "alice.wav"), "Changed.")
 
 
-def test_disconnect_stops_generation(replica):
+@pytest.mark.parametrize(("path", "field"), [("/api/tts", "text"), ("/v1/audio/speech", "input")])
+def test_disconnect_stops_generation(replica, path, field):
     """A cancelled request (client gone) sets the job's stop event and waits for generation to end."""
     started, stopped = threading.Event(), threading.Event()
 
-    def generate(text, voice, seed, speed, volume, language, sampling, job):
+    def generate(text, voice, seed, speed, volume, language, sampling, job, response_format):
         started.set()
         assert job.stop.wait(5)
         stopped.set()
@@ -275,15 +276,16 @@ def test_disconnect_stops_generation(replica):
     replica.generate = generate
 
     async def main():
-        body = json.dumps({"text": "Hello", "voice": "alice"}).encode()
+        body = json.dumps({field: "Hello", "voice": "alice"}).encode()
 
         async def receive():
             return {"type": "http.request", "body": body, "more_body": False}
 
         from starlette.requests import Request
 
-        request = Request({"type": "http", "method": "POST", "path": "/api/tts", "headers": []}, receive)
-        task = asyncio.ensure_future(replica.synthesize(request))
+        request = Request({"type": "http", "method": "POST", "path": path, "headers": []}, receive)
+        handler = replica.synthesize if path == "/api/tts" else replica.openai_speech
+        task = asyncio.ensure_future(handler(request))
         await asyncio.to_thread(started.wait, 5)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -445,3 +447,85 @@ def test_caller_is_logged(client, caplog):
     assert health.startswith("GET /health 200 ") and health.endswith(" consumer=svc email=a@example.com")
     assert synth.startswith("POST /api/tts 200 ")
     assert "secret" not in caplog.text
+
+
+def speech(client, **body):
+    return client.post("/v1/audio/speech", json={"model": "tts-1", "input": "Hello world.", "voice": "alice", **body})
+
+
+def openai_error(message, kind="invalid_request_error"):
+    return {"error": {"message": message, "type": kind, "param": None, "code": None}}
+
+
+@pytest.mark.parametrize(
+    ("response_format", "media_type", "container"),
+    [
+        (None, "audio/mpeg", "MP3"),
+        ("opus", "audio/ogg", "OGG"),
+        ("flac", "audio/flac", "FLAC"),
+        ("wav", "audio/wav", "WAV"),
+    ],
+)
+def test_openai_speech(client, replica, response_format, media_type, container):
+    body: dict[str, Any] = {"speed": 1.5, "instructions": "Cheerfully."}
+    if response_format:
+        body["response_format"] = response_format
+    response = speech(client, **body)
+    assert response.status_code == 200, response.text
+    assert response.headers["content-type"] == media_type
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["X-Sample-Rate"] == str(RATE)
+    assert float(response.headers["X-Audio-Seconds"]) == pytest.approx(1.0)
+    info = sf.info(io.BytesIO(response.content))
+    assert info.format == container and info.samplerate == RATE
+    assert info.duration == pytest.approx(1.0, abs=0.1)
+    (_, call) = replica.tts.calls[-1]
+    assert call["text"] == "Hello world."
+
+
+def test_openai_speech_pcm_and_api_tts_fields(client, replica):
+    response = speech(client, response_format="pcm", seed=3, language="english", volume=-30)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/pcm"
+    assert len(response.content) == 2 * replica.tts.audio.size
+    (_, call) = replica.tts.calls[-1]
+    assert call["language"] == "english"
+
+
+@pytest.mark.parametrize(
+    ("body", "status", "message"),
+    [
+        ({"response_format": "aac"}, 400, "response_format must be one of: mp3, opus, flac, wav, pcm"),
+        ({"stream_format": "sse"}, 400, "stream_format must be audio"),
+        ({"stream": True}, 400, "stream must be false"),
+        ({"voice": "alloy"}, 400, "Select a reference voice with an exact transcript"),
+        ({"speed": 4.0}, 400, "speed must be between 0.5 and 2.0"),
+        ({"input": ""}, 400, "Enter between 1 and 20000 characters"),
+        ({"input": " ".join(["word"] * 30), "max_tokens": 100}, 413, "Text is 30 tokens; at most 25 fit in max_tokens"),
+    ],
+)
+def test_openai_speech_errors(client, replica, body, status, message):
+    response = speech(client, **body)
+    assert response.status_code == status
+    assert response.json() == openai_error(message)
+    assert not [c for c in replica.tts.calls if c[0] == "generate"]
+
+
+@pytest.mark.parametrize("content", [b"", b"not json", b"[]", b'{"voice": "alice"}'])
+def test_openai_speech_malformed(client, content):
+    response = client.post("/v1/audio/speech", content=content)
+    assert response.status_code == 400
+    assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+def test_openai_speech_model_failure(client, replica):
+    replica.tts.audio = np.zeros(0, dtype=np.float32)
+    response = speech(client)
+    assert response.status_code == 500
+    assert response.json() == openai_error("Model generated no audio", "server_error")
+
+
+def test_openai_voices_and_models(client):
+    voices = [{"id": "alice", "name": "alice"}, {"id": "empty", "name": "empty"}]
+    assert client.get("/v1/audio/voices").json() == {"voices": voices}
+    assert client.get("/v1/audio/models").json() == {"models": [{"id": "Qwen/tiny"}]}

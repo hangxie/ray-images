@@ -94,7 +94,7 @@ COPY --chown=ray:users serve/chat/ /home/ray/serve/chat/
 COPY --chown=ray:users serve/meeting/ /home/ray/serve/meeting/
 ENV PYTHONPATH=/home/ray/serve/common:/home/ray/serve/tts:/home/ray/serve/stt:/home/ray/serve/chat:/home/ray/serve/meeting${PYTHONPATH:+:${PYTHONPATH}}
 RUN python3 -c "import sys; sys.modules['pyarrow'] = None; import serve_tts, serve_stt, serve_chat, serve_meeting, transformers; print('Serve apps:', serve_tts.app, serve_stt.app, serve_chat.app, serve_meeting.app, 'system transformers', transformers.__version__)" \
-    && /home/ray/voice-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, torch, transformers, serve_tts, serve_stt, silero_vad; silero_vad.load_silero_vad(); assert transformers.__version__ == '4.57.3', transformers.__version__; print('Voice venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
+    && /home/ray/voice-venv/bin/python -c "import sys; sys.modules['pyarrow'] = None; import qwen_tts, ray, soundfile, torch, transformers, serve_tts, serve_stt, silero_vad; silero_vad.load_silero_vad(); assert {'MP3', 'OGG', 'FLAC'} <= soundfile.available_formats().keys() and 'OPUS' in soundfile.available_subtypes('OGG'), soundfile.__libsndfile_version__; assert transformers.__version__ == '4.57.3', transformers.__version__; print('Voice venv: Ray', ray.__version__, 'torch', torch.__version__, 'transformers', transformers.__version__)"
 
 # Last, so a new version only changes image metadata and keeps the build cache
 ARG VERSION=dev
