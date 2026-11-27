@@ -61,6 +61,16 @@ STREAM_FRAMES = 12
 # with this margin a piece matches the full-clip decode; the decoder transformer before it gets the longer context.
 STREAM_VOCODER_MARGIN = 8
 
+# OpenAI's response_format values: libsndfile container, subtype and media type. No FFmpeg, so no `aac`; `pcm` is raw
+# little-endian 16-bit at the model's rate (X-Sample-Rate), as OpenAI's is at 24 kHz.
+OPENAI_FORMATS = {
+    "mp3": ("MP3", "MPEG_LAYER_III", "audio/mpeg"),
+    "opus": ("OGG", "OPUS", "audio/ogg"),
+    "flac": ("FLAC", "PCM_16", "audio/flac"),
+    "wav": ("WAV", "PCM_16", "audio/wav"),
+    "pcm": (None, None, "audio/pcm"),
+}
+
 logger = logging.getLogger("ray.serve")
 api = FastAPI()
 api.add_middleware(CallerLog)
@@ -73,6 +83,38 @@ async def http_error(request, exc):
         exc.status_code,
         headers={"Cache-Control": "no-store"},
     )
+
+
+class TextTooLong(ValueError):
+    """The text needs more codec tokens than max_tokens allows at the typical rate."""
+
+    def __init__(self, tokens, limit):
+        super().__init__(f"Text is {tokens} tokens; at most {limit} fit in max_tokens")
+        self.tokens, self.limit = tokens, limit
+
+
+async def request_json(request):
+    body = await request.body()
+    if not 0 < len(body) <= 100_000:
+        raise ValueError("Request must be between 1 and 100000 bytes")
+    return json.loads(body)
+
+
+def openai_error(status, message, kind="invalid_request_error"):
+    """An error in OpenAI's shape, for /v1 routes."""
+    return reply(status, {"error": {"message": message, "type": kind, "param": None, "code": None}})
+
+
+def encode(audio, sample_rate, response_format):
+    """16-bit audio in one of OPENAI_FORMATS (all through libsndfile); returns the bytes and their media type."""
+    import soundfile as sf
+
+    if response_format == "pcm":
+        return (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes(), "audio/pcm"
+    container, subtype, media_type = OPENAI_FORMATS[response_format]
+    output = io.BytesIO()
+    sf.write(output, audio, sample_rate, format=container, subtype=subtype)
+    return output.getvalue(), media_type
 
 
 def reply(status, body, media_type="application/json", headers=None):
@@ -465,76 +507,128 @@ class TTS:
     @api.post("/api/tts")
     async def synthesize(self, request: Request):
         try:
-            body = await request.body()
-            if not 0 < len(body) <= 100_000:
-                raise ValueError("Request must be between 1 and 100000 bytes")
-            req = json.loads(body)
-            text, voice = req["text"], req["voice"]
-            seed = int(req.get("seed", 0))
-            speed = float(req.get("speed", SPEED_DEFAULT))
-            volume = float(req.get("volume", VOLUME_DEFAULT))
-            language = req.get("language", "auto")
-            stream = req.get("stream", False)
-            sampling = {
-                name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()
-            }
-            if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
-                raise ValueError("Enter between 1 and 20000 characters")
-            if voice not in voices(self.voices_dir):
-                raise ValueError("Select a reference voice with an exact transcript")
-            if not 0 <= seed < 2**32:
-                raise ValueError("Seed must be between 0 and 4294967295")
-            if not isinstance(stream, bool):
-                raise ValueError("stream must be true or false")
-            if stream and speed != SPEED_DEFAULT:
-                raise ValueError("speed is not supported when streaming")
-            if not SPEED_MIN <= speed <= SPEED_MAX:
-                raise ValueError(f"speed must be between {SPEED_MIN} and {SPEED_MAX}")
-            if not VOLUME_MIN <= volume <= VOLUME_MAX:
-                raise ValueError(f"volume must be between {VOLUME_MIN} and {VOLUME_MAX} LUFS")
-            if language not in self.languages:
-                raise ValueError(f"Language must be one of: {', '.join(self.languages)}")
-            for name, (_, _, low, high) in self.sampling.items():
-                value = sampling[name]
-                if value is not None and not low <= value <= high:
-                    raise ValueError(f"{name} must be between {low} and {high}")
-            text_tokens = len(self.tts.processor.tokenizer.encode(text))
-            max_tokens = sampling["max_tokens"] or self.sampling["max_tokens"][3]
-            if text_tokens * SPEECH_TOKENS_PER_TEXT_TOKEN > max_tokens:
-                limit = max_tokens // SPEECH_TOKENS_PER_TEXT_TOKEN
-                return reply(
-                    413,
-                    {
-                        "error": f"Text is {text_tokens} tokens; at most {limit} fit in max_tokens",
-                        "tokens": text_tokens,
-                        "limit": limit,
-                    },
-                )
-            if sampling["max_tokens"] is None:
-                budget = max(MIN_SPEECH_TOKEN_BUDGET, SPEECH_TOKEN_BUDGET_PER_TEXT_TOKEN * text_tokens)
-                sampling["max_tokens"] = min(max_tokens, budget)
+            req = await request_json(request)
+            options = self.options(req)
+        except TextTooLong as exc:
+            return reply(413, {"error": str(exc), "tokens": exc.tokens, "limit": exc.limit})
         except (ValueError, TypeError, KeyError, AttributeError) as exc:
             return reply(400, {"error": str(exc)})
-        if stream:
-            return self.stream_speech(text, voice, seed, volume, language, sampling)
+        if options.pop("stream"):
+            options.pop("speed")
+            return self.stream_speech(**options)
+        try:
+            return reply(200, *await self.clip(options, "wav", "/api/tts"))
+        except Exception as exc:
+            return reply(500, {"error": str(exc)})
+
+    @api.post("/v1/audio/speech")
+    async def openai_speech(self, request: Request):
+        """OpenAI's speech API over the same synthesis: `input`, `voice`, `response_format` and `speed` map onto
+        /api/tts's fields, and /api/tts's other fields are accepted too. `model` and `instructions` are ignored."""
+        try:
+            req = await request_json(request)
+            if not isinstance(req, dict):
+                raise ValueError("Request must be a JSON object")
+            response_format = req.get("response_format", "mp3")
+            if response_format not in OPENAI_FORMATS:
+                raise ValueError(f"response_format must be one of: {', '.join(OPENAI_FORMATS)}")
+            if req.get("stream_format", "audio") != "audio":
+                raise ValueError("stream_format must be audio")
+            if req.get("stream", False) is not False:
+                raise ValueError("stream must be false")
+            fields = {k: v for k, v in req.items() if k not in ("input", "model", "instructions", "stream_format")}
+            options = self.options({**fields, "text": req["input"]})
+            options.pop("stream")
+        except KeyError as exc:
+            return openai_error(400, f"Missing field {exc}")
+        except TextTooLong as exc:
+            return openai_error(413, str(exc))
+        except (ValueError, TypeError, AttributeError) as exc:
+            return openai_error(400, str(exc))
+        try:
+            return reply(200, *await self.clip(options, response_format, "/v1/audio/speech"))
+        except Exception as exc:
+            return openai_error(500, str(exc), "server_error")
+
+    @api.get("/v1/audio/voices")
+    def openai_voices(self):
+        """The voices as OpenAI-style TTS servers list them, for clients such as Open WebUI that ask."""
+        return reply(200, {"voices": [{"id": name, "name": name} for name in voices(self.voices_dir)]})
+
+    @api.get("/v1/audio/models")
+    def openai_models(self):
+        return reply(200, {"models": [{"id": self.model_id}]})
+
+    async def clip(self, options, response_format, route):
+        """generate() in a worker thread; returns reply()'s body, media type and headers.
+
+        Shielded so a cancellation reaches the except below while generation keeps running until it sees the event.
+        """
         job = Job()
-        # Shielded so a cancellation reaches the except below while generation keeps running until it sees the event.
         task = asyncio.ensure_future(
-            asyncio.to_thread(self.generate, text, voice, seed, speed, volume, language, sampling, job)
+            asyncio.to_thread(self.generate, **options, response_format=response_format, job=job)
         )
         try:
-            return reply(200, *await asyncio.shield(task))
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
             # Serve cancels the request when the HTTP client disconnects. Wait for generation to stop at the next codec
             # frame so this replica is idle before Serve routes it the next queued request.
             job.stop.set()
-            logger.info("POST /api/tts abandoned: client disconnected")
+            logger.info("POST %s abandoned: client disconnected", route)
             with contextlib.suppress(Exception):
                 await task
             raise
-        except Exception as exc:
+        except Exception:
             logger.exception("Synthesis failed")
-            return reply(500, {"error": str(exc)})
+            raise
+
+    def options(self, req):
+        """Validate /api/tts's fields; returns generate()'s arguments plus `stream`. Raises ValueError (TextTooLong
+        when the text can't fit in max_tokens) or the TypeError, KeyError or AttributeError of a malformed field."""
+        text, voice = req["text"], req["voice"]
+        seed = int(req.get("seed", 0))
+        speed = float(req.get("speed", SPEED_DEFAULT))
+        volume = float(req.get("volume", VOLUME_DEFAULT))
+        language = req.get("language", "auto")
+        stream = req.get("stream", False)
+        sampling = {name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()}
+        if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
+            raise ValueError("Enter between 1 and 20000 characters")
+        if voice not in voices(self.voices_dir):
+            raise ValueError("Select a reference voice with an exact transcript")
+        if not 0 <= seed < 2**32:
+            raise ValueError("Seed must be between 0 and 4294967295")
+        if not isinstance(stream, bool):
+            raise ValueError("stream must be true or false")
+        if stream and speed != SPEED_DEFAULT:
+            raise ValueError("speed is not supported when streaming")
+        if not SPEED_MIN <= speed <= SPEED_MAX:
+            raise ValueError(f"speed must be between {SPEED_MIN} and {SPEED_MAX}")
+        if not VOLUME_MIN <= volume <= VOLUME_MAX:
+            raise ValueError(f"volume must be between {VOLUME_MIN} and {VOLUME_MAX} LUFS")
+        if language not in self.languages:
+            raise ValueError(f"Language must be one of: {', '.join(self.languages)}")
+        for name, (_, _, low, high) in self.sampling.items():
+            value = sampling[name]
+            if value is not None and not low <= value <= high:
+                raise ValueError(f"{name} must be between {low} and {high}")
+        text_tokens = len(self.tts.processor.tokenizer.encode(text))
+        max_tokens = sampling["max_tokens"] or self.sampling["max_tokens"][3]
+        if text_tokens * SPEECH_TOKENS_PER_TEXT_TOKEN > max_tokens:
+            raise TextTooLong(text_tokens, max_tokens // SPEECH_TOKENS_PER_TEXT_TOKEN)
+        if sampling["max_tokens"] is None:
+            budget = max(MIN_SPEECH_TOKEN_BUDGET, SPEECH_TOKEN_BUDGET_PER_TEXT_TOKEN * text_tokens)
+            sampling["max_tokens"] = min(max_tokens, budget)
+        return {
+            "text": text,
+            "voice": voice,
+            "seed": seed,
+            "speed": speed,
+            "volume": volume,
+            "language": language,
+            "sampling": sampling,
+            "stream": stream,
+        }
 
     def stream_speech(self, text, voice, seed, volume, language, sampling):
         """Reply with NDJSON as speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
@@ -644,9 +738,8 @@ class TTS:
             max_new_tokens=sampling["max_tokens"],
         )
 
-    def generate(self, text, voice, seed, speed, volume, language, sampling, job):
+    def generate(self, text, voice, seed, speed, volume, language, sampling, job, response_format="wav"):
         """Synthesize in a worker thread; returns reply()'s body, media type and headers."""
-        import soundfile as sf
         import torch
 
         wavs, sample_rate = self.run(text, voice, seed, language, sampling, job)
@@ -662,12 +755,12 @@ class TTS:
         if duration <= 0:
             raise ValueError("Model generated empty audio")
         audio, loudness, loudness_limited = normalize_loudness(audio, sample_rate, volume)
-        output = io.BytesIO()
-        sf.write(output, audio, sample_rate, format="WAV", subtype="PCM_16")
+        body, media_type = encode(audio, sample_rate, response_format)
         return (
-            output.getvalue(),
-            "audio/wav",
+            body,
+            media_type,
             {
+                "X-Sample-Rate": sample_rate,
                 "X-Synthesis-Seconds": f"{elapsed:.2f}",
                 "X-Audio-Seconds": f"{duration:.2f}",
                 "X-RTF": f"{elapsed / duration:.3f}",
