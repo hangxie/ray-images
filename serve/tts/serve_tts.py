@@ -27,6 +27,8 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from ray import serve
 from starlette.exceptions import HTTPException
 
+from caller_log import CallerLog
+
 ROOT = Path(__file__).resolve().parent
 VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
 VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
@@ -61,6 +63,7 @@ STREAM_VOCODER_MARGIN = 8
 
 logger = logging.getLogger("ray.serve")
 api = FastAPI()
+api.add_middleware(CallerLog)
 
 
 @api.exception_handler(HTTPException)

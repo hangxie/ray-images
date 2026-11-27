@@ -43,7 +43,7 @@ explicit = true
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-src = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
+src = ["serve/common", "serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RUF"]
@@ -52,7 +52,7 @@ select = ["E", "F", "W", "I", "B", "UP", "SIM", "C4", "PIE", "RUF"]
 python_version = "3.12"
 check_untyped_defs = true
 files = ["serve", "scripts", "tests"]
-mypy_path = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts", "tests"]
+mypy_path = ["serve/common", "serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts", "tests"]
 explicit_package_bases = true
 
 # No type information; flashinfer_jit_cache only exists in the image
@@ -62,7 +62,7 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
+pythonpath = ["serve/common", "serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
 addopts = ["-ra", "--strict-markers", "-m", "not network"]
 markers = ["network: reads PyPI; run by `make pins`, not `make test`"]
 filterwarnings = [

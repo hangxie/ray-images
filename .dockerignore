@@ -2,6 +2,7 @@
 *
 !scripts/prune_flashinfer_cache.py
 !serve/check_requirements.py
+!serve/common/
 !serve/tts/
 !serve/stt/
 !serve/chat/
