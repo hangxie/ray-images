@@ -1,79 +1,63 @@
 # AGENTS.md
 
-Container image for the homelab Ray cluster, `hangxie/ray-images`: Ray with vLLM, plus Qwen3-TTS and Whisper STT Ray Serve apps in their own virtualenv and CPU-only voice chat and meeting notes Serve apps that drive them. The head, LLM workers, and TTS workers all run it. See `README.md` for what the image contains and how the TTS app behaves. CI (`.github/workflows/check.yml`) runs `make check` — ruff, mypy, and a CPU test suite against tiny random qwen-tts models. GPU behavior is only testable by building the image and running it on the homelab cluster.
+Container image `hangxie/ray-images` for the homelab Ray cluster: Ray with vLLM, plus Ray Serve apps for TTS (Qwen3-TTS), STT (Whisper), voice chat and meeting notes. `README.md` says what the image contains and why. CI runs `make check`; GPU behavior is only testable on the homelab cluster.
 
 ## Layout
 
-- `Dockerfile` — the image: vLLM and FlashInfer steps first, then Brotli, then the voice virtualenv layer, then the Serve apps.
-- `serve/` — the Ray Serve apps, one directory each, plus `common/`, all on the image's `PYTHONPATH` so they import by module name. `serve/tts/`: `serve_tts:app` from `serve_tts.py` (deployment, HTTP API, hooks, streaming), `cuda_graphs.py` (CUDA-graph decoding), `index.html`. `serve/stt/`: `serve_stt:app` from `serve_stt.py` (Whisper, OpenAI transcription API and the `audio/stream` WebSocket, all under `/v1` in the app's own routes, page at `/`), `stt.html` (plain Record/Stop page: one upload, no features). `serve/chat/`: `serve_chat:app` from `serve_chat.py` (voice chat: STT → streamed LLM → TTS per sentence, no models, system Python), `chat.html`. `serve/meeting/`: `serve_meeting:app` from `serve_meeting.py` (meeting notes: relays the page's WebSocket to STT's `audio/stream`, no models, system Python), `meeting.html`. `serve/common/`: `caller_log.py`, the middleware every app adds to log who made a request (README, Endpoints); stdlib only. The build writes the image tag to `serve/VERSION`, which every app reads.
-- `serve/check_requirements.py` — build-time dependency check for the voice virtualenv.
-- `scripts/prune_flashinfer_cache.py` — build-time removal of FlashInfer cache modules the target GPUs can't run.
-- `scripts/check_markdown.py` — the Markdown rules below, run by `make lint`.
-- `tests/` — pytest suite for the CPU-testable parts (see Testing).
-- `pyproject.toml`, `uv.lock` — the development environment (uv), ruff, mypy and pytest settings. Not used by the image.
-- `Makefile` — `make dev`, `format`, `lint` (ruff, mypy, Markdown), `test`, `check`, `pins`; `make build` → `hangxie/ray-images:$(VERSION)`.
+- `Dockerfile` — vLLM and FlashInfer layers first, then the voice virtualenv, then the Serve apps.
+- `serve/{tts,stt,chat,meeting}/` — one Serve app each (`serve_<name>:app`), plus `serve/common/` for shared code; all on the image's `PYTHONPATH`.
+- `serve/check_requirements.py`, `scripts/` — build-time checks and FlashInfer pruning; `scripts/check_markdown.py` enforces the Markdown rules below.
+- `tests/` — CPU pytest suite. `pyproject.toml`/`uv.lock` are the dev environment only, not the image.
 
 ## Rules
 
-- **One image.** Don't split vLLM and TTS into separate images: the head's copy of `serve_tts` decides the deployment options and the workers' copy runs synthesis, so both must come from one build.
-- **Two Python environments.** The system Python carries vLLM (transformers 5.x). `/home/ray/voice-venv` (`--system-site-packages`) carries qwen-tts, transformers 4.57.3 and silero-vad (STT's stream) and reuses the system Ray, torch, torchaudio, and CUDA libraries; install into it with torch/torchaudio constrained to the system versions so it never gets its own copy. TTS and STT replicas use it through `runtime_env` `py_executable`.
-- **Dependency checks.** `pip check` must pass for the system environment. In the venv, `pip check` always reports vLLM's transformers requirement, so `serve/check_requirements.py` must pass there instead. Don't install with `--no-deps` or drop declared dependencies to save space.
-- **Layer order.** Keep the TTS layers after the vLLM layers so a TTS change doesn't rebuild vLLM.
-- **Serve app imports.** The head imports `serve_tts.py`, `serve_stt.py`, `serve_chat.py`, and `serve_meeting.py` with the system Python to build the apps. Module-level imports stay limited to what both environments have (stdlib, numpy, scipy, fastapi, ray, and websockets, which Ray Serve installs); import `torch`, `transformers`, `qwen_tts`, `soundfile` inside the replica. Nothing module-level that can't be pickled (e.g. `threading.local`) — Serve pickles the FastAPI app.
-- **Replica settings go through `bind()`.** A deployment's `runtime_env` replaces the application's instead of merging, so replicas don't see the application's `env_vars`. Read `TTS_*` settings on the head (`settings()`) and pass them as `TTS.bind()` arguments; module-level globals must not decide replica behavior. Library variables that must reach the replica process (`HF_*`) go in the deployment's own `runtime_env`.
-- **CUDA graphs.** `cuda_graphs.py` must stay equivalent to qwen-tts's eager path: greedy codes and talker hidden states from the graph bodies run eagerly must match HF `generate` on small random models (`tests/test_cuda_graphs.py`). Sampling options, the end-of-speech hook and the disconnect check stay outside the captured graphs. `TTS_CUDA_GRAPHS=0` falls back to eager decoding for comparison.
-- **Target GPUs.** The image keeps only FlashInfer modules `FLASHINFER_KEEP_ARCHS` (default `8.6`, the RTX 3050s) can run. Add an architecture, or use `all`, before deploying to other GPUs. Peak TTS memory is 5.37 of 6 GB, so check `X-Peak-CUDA-GB` after changes that add GPU memory (`TTS_KV_CACHE_TOKENS` sizes the talker cache).
-- **HTTP surface.** Keep `/`, `/health`, `/voices`, `POST /api/tts` (fields, ranges, error codes, `X-*` headers, the `stream` NDJSON events) compatible with site-up's `index.html`, `txt2mp3.sh` and voice chat, `serve_tts`'s `POST /v1/audio/speech` compatible with OpenAI's speech API for Open WebUI, `serve_stt` compatible with OpenAI's `/v1/audio/transcriptions` as site-up's `mlx-stt-svc` serves it plus its own `/v1/audio/stream` WebSocket and `/v1/health` `languages` for `serve_meeting`, and a plain page at `/` that uses only `v1/audio/transcriptions` (features go in `serve_meeting`, which redeploys without reloading Whisper); `serve_meeting` (`/`, `/health`, `WS /api/stream` relaying STT's events unchanged) has no outside client to stay compatible with; and `serve_chat` (`/`, `/health`, `/api/voices`, `POST /api/chat` and its NDJSON events) compatible with site-up's voice chat page.
-- **No auth in the image.** Don't add API keys or login checks to the Serve apps; the deployment provides them in front (README, Endpoints).
-- **Streaming decode.** `decode_tail` repeats `Qwen3TTSTokenizerV2Decoder.forward` with the vocoder cut to the last frames; `tests/test_tts_generation.py` checks it, and that streamed pieces still match the full-clip decode; rerun it when upgrading qwen-tts.
-- **Versions and labels.** Candidates under test are image tags `vX.Y.Z-rcN` only, not git tags. A release is a git tag `vX.Y.Z` on the merged commit plus the image tag, rebuilt from cache with `VERSION=vX.Y.Z` so only the version label changes from the tested rc. Upstream versions are `ARG`s recorded as `io.github.hangxie.ray-images.*` labels. The version label is set last in the Dockerfile and also passed with `--label` by the Makefile.
+- **One image.** The head's copy of each app decides deployment options and the workers' copy runs it, so vLLM and the Serve apps ship in one build.
+- **Two Python environments.** System Python has vLLM (transformers 5.x). `/home/ray/voice-venv` (`--system-site-packages`) adds qwen-tts, transformers 4.57.3 and silero-vad on top of the system Ray, torch and CUDA; install into it with torch/torchaudio constrained to the system versions. TTS and STT replicas use it via `runtime_env` `py_executable`.
+- **Dependency checks.** `pip check` must pass in the system environment and `serve/check_requirements.py` in the venv (where `pip check` always flags vLLM's transformers pin). No `--no-deps` or dropped dependencies to save space.
+- **Layer order.** Serve app and venv layers stay after the vLLM layers.
+- **Serve app imports.** The head imports every app with the system Python, so module-level imports are limited to stdlib, numpy, scipy, fastapi, ray and websockets; import `torch`, `transformers`, `qwen_tts`, `soundfile` inside the replica. Nothing unpicklable at module level (e.g. `threading.local`): Serve pickles the FastAPI app.
+- **Replica settings go through `bind()`.** A deployment's `runtime_env` replaces the application's, so read settings on the head (`settings()`) and pass them to `.bind()`; module-level globals must not decide replica behavior. Variables the replica process itself needs (`HF_*`) go in the deployment's `runtime_env`.
+- **CUDA graphs.** `cuda_graphs.py` must match qwen-tts's eager path (`tests/test_cuda_graphs.py`). Sampling, the end-of-speech hook and the disconnect check stay outside captured graphs; `TTS_CUDA_GRAPHS=0` decodes eagerly.
+- **Target GPUs.** FlashInfer modules are pruned to `FLASHINFER_KEEP_ARCHS` (default `8.6`, the RTX 3050s); widen it before deploying elsewhere. TTS peaks at 5.37 of 6 GB, so check `X-Peak-CUDA-GB` after changes that add GPU memory.
+- **HTTP surface.** Existing routes, fields, error codes, `X-*` headers and NDJSON events are a contract with site-up's TTS page, `txt2mp3.sh` and voice chat page, and with OpenAI clients (`/v1/audio/speech`, `/v1/audio/transcriptions`). STT's page stays a plain uploader; live features go in the meeting app, which redeploys without reloading Whisper.
+- **No auth in the image.** The deployment authenticates in front; apps only log the identity headers it sets.
+- **Versions and labels.** Test candidates are image tags `vX.Y.Z-rcN` only. A release is git tag `vX.Y.Z` on the merged commit plus an image rebuilt from cache with `VERSION=vX.Y.Z`, so only the version label and `serve/VERSION` differ from the tested rc.
 - **Fix in place.** No parallel versions, shims, or `v2` copies.
-- **Docs.** `README.md` records *why* for non-obvious choices (version pairings, what is omitted to save size). Markdown prose must not use hard line breaks: keep each paragraph and list item on a single source line and let renderers wrap; code blocks and tables are exempt. Markdown files must not contain tabs.
-- **Short commit messages.** Imperative subject under 72 chars; body at most one line saying what changed. Rationale, issue references (`Closes #N`), and testing go in the PR description.
-- **No AI/agent attribution** in commits, PRs, issues, or docs (no `Co-Authored-By`, `Generated with ...`, etc.).
+- **Docs.** `README.md` records *why* for non-obvious choices. Markdown prose has no hard line breaks (one line per paragraph or list item) and no tabs.
+- **Commits.** Imperative subject under 72 chars, body at most one line; rationale, testing and `Closes #N` go in the PR. No AI/agent attribution anywhere.
 
 ## Commands
 
 ```bash
-make dev                            # .venv from uv.lock (uv sync --dev --locked)
-make format                         # ruff format + safe fixes
-make check                          # lint + tests; what CI runs
-make lock                           # after changing pyproject.toml
-make build                          # tagged with `git describe --tags`
-make build VERSION=v0.4.0-rc1       # explicit tag
-docker inspect -f '{{json .Config.Labels}}' hangxie/ray-images:<tag>
+make dev                         # .venv from uv.lock
+make format                      # ruff format + fixes
+make check                       # lint + tests (CI)
+make lock                        # after changing pyproject.toml
+make build VERSION=v0.4.0-rc1    # default tag: git describe --tags
 podman push localhost/hangxie/ray-images:<tag> docker.io/hangxie/ray-images:<tag>
 ```
 
 ## Change workflow
 
-1. **Branch** off `main`.
-2. **Check** (`make check`); lint and tests must pass. Add or update tests for what changed where it can run on CPU.
-3. **Build locally** (`make build`); the build-time dependency and import checks must pass.
-4. **Validate on the homelab cluster** for anything that changes runtime behavior (model loading, generation, CUDA libraries, Python environments). List what was validated, and what still needs it, in the PR description.
-5. **Commit and PR** against `main`; push the branch to `origin`. Publish `vX.Y.Z-rcN` images for cluster testing as needed.
-6. **Release** after merge: git tag `vX.Y.Z`, rebuild with `VERSION=vX.Y.Z`, push the image, and record cluster measurements (RTF, peak CUDA memory, image size) in the GitHub release notes.
+1. Branch off `main`; `make check` passes, with CPU tests for what changed.
+2. `make build`; its dependency and import checks must pass.
+3. Validate runtime changes (models, generation, CUDA, Python environments) on the cluster via `vX.Y.Z-rcN` images; list what was and wasn't validated in the PR.
+4. After merge, release: tag, rebuild with `VERSION=vX.Y.Z`, push, and put cluster measurements (RTF, peak CUDA memory, image size) in the GitHub release notes.
 
 ## Testing
 
-`make test` runs on CPU in the uv environment, which mirrors the voice venv: Ray 2.59.0, torch/torchaudio/fastapi at vLLM 0.27.0's pins, qwen-tts 0.1.1 with transformers 4.57.3, silero-vad 6.3 (CPU torch wheels on Linux). Keep those pins in step with the Dockerfile; `tests/test_pins.py` fails when they drift. Its vLLM check reads PyPI, so it runs in `make pins` (and CI), not `make test`.
-
-- `tests/conftest.py` builds tiny random qwen-tts models (talker + code predictor, and a speech-tokenizer decoder at the real upsampling rates), so tests run the code that reaches into qwen-tts internals against the installed version. Their weights are re-initialized larger than the default init, which decodes silence and attends almost uniformly, hiding mistakes.
-- Generation runs under `torch.no_grad()`, as `generate_voice_clone` does; inference mode would make the static caches inference tensors.
-- HTTP tests drive the real FastAPI routes with a hand-built replica (`object.__new__` on the deployment's class) by overriding Serve's `get_current_servable_instance` dependency; only the model is faked.
-- `tests/test_head.py` imports both apps with the replica-only packages blocked, and pickles the app and replica class, as the head does.
-- `tests/test_serve_meeting.py` runs the meeting relay against `serve_stt`'s real routes (fake Whisper) under uvicorn on loopback, so the `websockets` client and both sockets are real. `tests/test_meeting_page.py` runs `meeting.html`'s script, as `GET /` serves it, in node against fake browser APIs (`tests/meeting_page.js`): the language menu, and a meeting from the first audio frame to `done`. `tests/test_stt_page.py` does the same for `stt.html` (`tests/stt_page.js`): one recording from Record to its text, and an error. Both skip without node; extend them when a page changes.
-- Not covered on CPU: `TTS.__init__`/`STT.__init__` (real checkpoints on `cuda:0`), `STT.transcribe`, `warm_up`, and CUDA graph capture/replay itself. Those still need the cluster.
+- The uv environment mirrors the voice venv's pins; `tests/test_pins.py` fails when they drift from the Dockerfile (its PyPI check runs in `make pins` and CI).
+- `tests/conftest.py` builds tiny random qwen-tts models with enlarged weights (the default init decodes silence and hides mistakes), so tests exercise the code that reaches into qwen-tts internals.
+- HTTP tests drive the real FastAPI routes with a hand-built replica (`object.__new__`) through Serve's `get_current_servable_instance` dependency; only the model is faked. Page scripts run in node against fake browser APIs and skip without node; extend them when a page changes.
+- Not covered on CPU: model loading on `cuda:0`, `STT.transcribe`, `warm_up`, and CUDA graph capture/replay.
 
 ## Gotchas
 
-- Local builds on Apple Silicon run under amd64 emulation (qemu). The base image's `pyarrow` native library segfaults there, which also breaks `from ray import serve` and `import qwen_tts` (via gradio → pandas); build-time import checks therefore block it with `sys.modules['pyarrow'] = None`. A local Ray cluster doesn't start either (the GCS server never comes up), and GPU code can't run at all, so Serve and CUDA behavior are only testable on the cluster.
-- Podman's layer cache reuses the final `LABEL` layer when only `VERSION` changes — hence the Makefile's `--label`.
-- Podman stores local images as `localhost/<name>`; `podman push docker.io/<name>` fails with "image not known" but still exits 0. Push with an explicit source and destination.
-- Docker Hub creates a repository on its first push, with the account's default visibility.
-- The Podman VM disk fills up quickly with ~13 GB images and their build leftovers; a failed layer commit reports "no space".
-- `docker build .` sends the whole directory as context; `.dockerignore` keeps only what the Dockerfile copies, so the dev `.venv` stays out. Add a path there when the Dockerfile copies a new one.
-- A layer can't shrink what an earlier layer added; deleting base-image files in a later `RUN` doesn't reduce image size. Pruning must happen in the same `RUN` as the install.
-- A full rebuild (empty cache) re-resolves unpinned dependencies and gives every layer a new digest, so the next push re-uploads all ~6 GB. Compare package versions with the previous image before shipping it.
-- HF `generate` treats a compileable cache (`StaticCache`) as a request to auto-compile the forward and builds a 4D attention mask, which breaks the talker's rotary positions at prefill. `cuda_graphs.GraphCache` reports itself non-compileable for that reason.
-- qwen-tts internals: `serve_tts.py` wraps the talker's `generate` for the end-of-speech and disconnect hooks (`Qwen3TTSForConditionalGeneration.generate` drops unknown kwargs), and `cuda_graphs.py` replaces `code_predictor.generate` and `talker.model.forward`. Rerun `make test` when upgrading qwen-tts or transformers, and bump their pins in `pyproject.toml` with the Dockerfile's.
+- Image builds on Apple Silicon run under qemu, where the base image's `pyarrow` segfaults (breaking `ray.serve` and `qwen_tts` imports), so build-time checks set `sys.modules['pyarrow'] = None`. Ray doesn't start inside the emulated image, but Serve runs natively from the dev `.venv` (`serve run serve_meeting:app` with the `serve/*` dirs on `PYTHONPATH`; keep `RAY_TMPDIR` short, sockets are capped at 103 bytes).
+- Podman reuses the final `LABEL` layer when only `VERSION` changes, hence the Makefile's `--label`. Local images are `localhost/<name>`; `podman push docker.io/<name>` fails with "image not known" yet exits 0, so push with explicit source and destination.
+- The Podman VM disk fills fast with ~13 GB images; a failed layer commit reports "no space".
+- `.dockerignore` excludes everything the Dockerfile doesn't copy (above all `.venv`); add new paths there.
+- Deleting files in a later layer doesn't shrink the image; prune in the same `RUN` as the install.
+- A cache-less rebuild re-resolves unpinned packages and re-uploads all ~6 GB; compare package versions with the previous image first.
+- HF `generate` auto-compiles with a compileable cache and builds a 4D mask that breaks the talker's rotary positions, so `cuda_graphs.GraphCache` reports itself non-compileable.
+- `serve_tts.py` wraps the talker's `generate` for its hooks and `decode_tail` repeats the speech-tokenizer decoder's `forward`, and `cuda_graphs.py` replaces `code_predictor.generate` and `talker.model.forward`; rerun `make test` and bump pins in both `pyproject.toml` and the Dockerfile when upgrading qwen-tts or transformers.
