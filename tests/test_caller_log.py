@@ -87,6 +87,17 @@ def test_websocket_with_identity(client, caplog):
     assert refused.startswith("WS /refuse refused ")
 
 
+def test_reverse_proxy_email(client, caplog):
+    """OAuth2 Proxy in front of an app (the TTS page) forwards the user as X-Forwarded-Email."""
+    caplog.set_level(logging.INFO, "ray.serve")
+    assert client.get("/ok", headers={"X-Forwarded-Email": "page@example.com"}).status_code == 200
+    both = {"X-Forwarded-Email": "page@example.com", "X-Auth-Request-Email": "auth@example.com"}
+    assert client.get("/ok", headers=both).status_code == 200
+    page, preferred = lines(caplog)
+    assert page.startswith("GET /ok 200 ") and page.endswith(" email=page@example.com")
+    assert preferred.endswith(" email=auth@example.com")
+
+
 def test_values_stay_on_one_line():
     assert clean(b"a b\tc\x7fd") == "a?b?c?d"
     assert clean("é".encode()) == "??"

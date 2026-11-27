@@ -1,8 +1,9 @@
 """Log who made each request, as the deployment's proxy or authorizer reports it.
 
-The image has no auth (AGENTS.md, No auth in the image); the homelab Gateway's bearer check sets `X-Consumer` and
-OAuth2 Proxy sets `X-Auth-Request-Email`. Requests carrying either get one log line with the caller, the request and
-its outcome; Serve's own access log already covers the rest. `Authorization` is never read.
+The image has no auth (AGENTS.md, No auth in the image); the homelab Gateway's bearer check sets `X-Consumer`, and
+OAuth2 Proxy sets `X-Auth-Request-Email` as a Gateway auth check or `X-Forwarded-Email` as a reverse proxy in front of
+an app. Requests carrying any of them get one log line with the caller, the request and its outcome; Serve's own access
+log already covers the rest. `Authorization` is never read.
 
 Stdlib only, since the head imports it with the system Python.
 """
@@ -12,8 +13,13 @@ import time
 
 logger = logging.getLogger("ray.serve")
 
-# Header, as ASGI gives it (lower case), and the name it is logged under.
-IDENTITY_HEADERS = ((b"x-consumer", "consumer"), (b"x-auth-request-email", "email"))
+# Header, as ASGI gives it (lower case), and the name it is logged under; for a name more than one header sets, the
+# first listed that the request carries wins.
+IDENTITY_HEADERS = (
+    (b"x-consumer", "consumer"),
+    (b"x-auth-request-email", "email"),
+    (b"x-forwarded-email", "email"),
+)
 MAX_VALUE_LENGTH = 200
 
 
@@ -25,12 +31,14 @@ def clean(value):
 
 def identity(scope):
     """The caller's identity fields, in IDENTITY_HEADERS order, from the request's headers."""
-    found = {}
+    headers: dict[bytes, bytes] = {}
     for name, value in scope.get("headers", ()):
-        for header, field in IDENTITY_HEADERS:
-            if name.lower() == header and field not in found:
-                found[field] = clean(value)
-    return [(field, found[field]) for _, field in IDENTITY_HEADERS if field in found]
+        headers.setdefault(name.lower(), value)
+    found: dict[str, str] = {}
+    for header, field in IDENTITY_HEADERS:
+        if header in headers and field not in found:
+            found[field] = clean(headers[header])
+    return list(found.items())
 
 
 class CallerLog:
