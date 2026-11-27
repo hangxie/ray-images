@@ -32,9 +32,10 @@ class Backends:
         self.reply = ["Hello there. ", "How are ", "you today?"]
         self.llm_end = "done"  # after the reply: "done" ([DONE]), "error" (an SSE error event), "eof"
         self.tts_busy = 0  # answer this many TTS requests with 503 first
-        self.tts_wav = False  # answer with a whole WAV instead of NDJSON
+        self.tts_plain = False  # answer with a whole clip instead of an event stream
+        self.tts_error = None  # after the first piece, end the stream with this error
         self.tts_hold = None  # an Event: after the first piece, wait for the client to hang up and set it
-        self.discovery: list[int] = []  # statuses for the next TTS /health and /voices requests, then 200
+        self.discovery: list[int] = []  # statuses for the next TTS /health and /audio/voices requests, then 200
         self.requests: list[tuple[str, Any]] = []
         self.ports: list[tuple[str, int]] = []  # (request, client port): which connection each request came on
         backends = self
@@ -55,9 +56,11 @@ class Backends:
                 self.end_headers()
                 self.wfile.write(body)
 
-            def start_stream(self, content_type):
+            def start_stream(self, content_type, headers=None):
                 self.send_response(200)
                 self.send_header("Content-Type", content_type)
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
                 self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
 
@@ -72,8 +75,9 @@ class Backends:
                     return self.send(backends.discovery.pop(0), {"error": "busy"})
                 if self.path == "/tts/health":
                     return self.send(200, {"status": "ok", "languages": ["auto", "chinese", "english"]})
-                if self.path == "/tts/voices":
-                    return self.send(200, ["alice", "bob"])
+                if self.path == "/tts/audio/voices":
+                    voices = [{"id": "alice", "name": "alice"}, {"id": "bob", "name": "bob"}]
+                    return self.send(200, {"voices": voices})
                 self.send(404, {"error": "Not found"})
 
             def do_POST(self):
@@ -103,18 +107,23 @@ class Backends:
                 if backends.tts_busy:
                     backends.tts_busy -= 1
                     return self.send(503, {"error": "busy"})
-                if backends.tts_wav:
-                    return self.send(200, b"RIFF-wav", "audio/wav", {"X-RTF": "0.5", "X-Audio-Seconds": "1.25"})
-                self.start_stream("application/x-ndjson")
+                if backends.tts_plain:
+                    return self.send(200, b"\0\0" * 2400, "audio/pcm")
+                self.start_stream("text/event-stream", {"X-Sample-Rate": "24000"})
                 pcm = base64.b64encode(b"\0\0" * 2400).decode()  # 0.1 s at 24 kHz
                 for _ in range(2):
-                    self.chunk(json.dumps({"type": "audio", "sample_rate": 24000, "pcm": pcm}).encode() + b"\n")
+                    self.chunk(b"data: " + json.dumps({"type": "speech.audio.delta", "audio": pcm}).encode() + b"\n\n")
+                    if backends.tts_error is not None:
+                        error = {"type": "error", "error": {"message": backends.tts_error}}
+                        self.chunk(b"data: " + json.dumps(error).encode() + b"\n\n")
+                        self.chunk(b"")
+                        return None
                     if backends.tts_hold is not None:
                         self.connection.recv(1)  # returns once the client shuts the connection
                         backends.tts_hold.set()
                         self.close_connection = True
                         return None
-                self.chunk(b'{"type": "done"}\n')
+                self.chunk(b'data: {"type": "speech.audio.done", "usage": {}}\n\n')
                 self.chunk(b"")
                 return None
 
@@ -235,7 +244,7 @@ def test_settings(monkeypatch):
         "CHAT_LLM_URL": "http://llm/v1",
         "CHAT_LLM_MODEL": "big",
         "CHAT_LLM_MAX_TOKENS": "100",
-        "CHAT_TTS_URL": "http://tts/",
+        "CHAT_TTS_URL": "http://tts/v1/",
         "CHAT_VOICE": "alice",
         "CHAT_SYSTEM_PROMPT": "Talk.",
         "CHAT_LLM_TOKEN": "secret",
@@ -246,7 +255,7 @@ def test_settings(monkeypatch):
         "llm_url": "http://llm/v1",
         "llm_model": "big",
         "llm_max_tokens": 100,
-        "tts_url": "http://tts",
+        "tts_url": "http://tts/v1",
         "voice": "alice",
         "system_prompt": "Talk.",
         "tokens": {"STT": "", "LLM": "secret", "TTS": ""},
@@ -303,7 +312,7 @@ def test_tokens_are_sent_to_their_backend(backends):
         client.get("/api/voices")
     finally:
         serve_chat.api.dependency_overrides.clear()
-    assert ("GET /tts/voices", "Bearer tts-pat") in backends.requests
+    assert ("GET /tts/audio/voices", "Bearer tts-pat") in backends.requests
 
 
 def test_unknown_route_is_json_404(client):
@@ -330,9 +339,9 @@ def test_text_turn(client, backends):
     assert llm["chat_template_kwargs"] == {"enable_thinking": False}
     assert llm["messages"][0]["content"].startswith("Be brief.\nReply in the language of the user's latest message")
     assert llm["messages"][1:] == [{"role": "assistant", "content": "Earlier."}, {"role": "user", "content": "Hi"}]
-    assert [(t["text"], t["voice"], t["language"], t["stream"]) for t in backends.sent("tts")] == [
-        ("Hello there.", "bob", "auto", True),
-        ("How are you today?", "bob", "auto", True),
+    assert backends.sent("tts") == [
+        {"input": text, "voice": "bob", "language": "auto", "response_format": "pcm", "stream_format": "sse"}
+        for text in ("Hello there.", "How are you today?")
     ]
     assert backends.sent("stt") == []
 
@@ -388,11 +397,20 @@ def test_busy_tts_is_retried(client, backends):
     assert len(backends.sent("tts")) == 4  # two 503s, then one request per chunk
 
 
-def test_wav_tts_backend(client, backends):
-    backends.tts_wav = True
-    events = [e for e in chat(client, text="Hi") if e["type"] == "audio"]
-    assert events[0]["wav"] == base64.b64encode(b"RIFF-wav").decode()
-    assert (events[0]["seconds"], events[0]["rtf"], events[0]["text"]) == (1.25, 0.5, "Hello there.")
+def test_tts_stream_error(client, backends):
+    backends.tts_error = "CUDA out of memory"
+    events = chat(client, text="Hi")
+    assert [e["part"] for e in events if e["type"] == "audio"] == [0]  # the turn stops speaking at the error
+    assert {"type": "error", "stage": "tts", "message": "TTS returned 500: CUDA out of memory"} in events
+    assert events[-1]["type"] == "done"
+
+
+def test_tts_without_an_event_stream_is_an_error(client, backends):
+    backends.tts_plain = True
+    events = chat(client, text="Hi")
+    error = {"type": "error", "stage": "tts", "message": "TTS returned 200: answered without an event stream"}
+    assert error in events
+    assert not [e for e in events if e["type"] == "audio"]
 
 
 @pytest.mark.parametrize(
@@ -527,14 +545,14 @@ def test_llm_stream_failure_after_200_is_an_error(client, backends, end, message
     events = chat(client, text="Hi")
     assert {"type": "error", "stage": "llm", "message": message} in events
     assert events[-1]["type"] == "done" and events[-1]["reply"] == "Hello there. And then"
-    assert [t["text"] for t in backends.sent("tts")] == ["Hello there."]  # the unfinished sentence is not spoken
+    assert [t["input"] for t in backends.sent("tts")] == ["Hello there."]  # the unfinished sentence is not spoken
 
 
 def test_backend_connections_are_reused(client, backends):
     """TTS sentences and later turns reuse kept-alive connections instead of opening one per call."""
     chat(client, audio=WAV)
     chat(client, audio=WAV)
-    tts = [port for path, port in backends.ports if path == "/tts/api/tts"]
+    tts = [port for path, port in backends.ports if path == "/tts/audio/speech"]
     assert len(tts) == 4
     assert len(set(tts)) < len(tts)
     stt = [port for path, port in backends.ports if path == "/v1/audio/transcriptions"]

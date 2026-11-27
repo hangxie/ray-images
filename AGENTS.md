@@ -6,7 +6,7 @@ Two container images for the homelab Ray clusters: `hangxie/ray-vllm` (Ray with 
 
 - `docker/vllm/Dockerfile`, `docker/voice/Dockerfile` — one per image, both built from the repository root.
 - `serve/{tts,stt,chat,meeting}/` — one Serve app each (`serve_<name>:app`), plus `serve/common/` for shared code; all on the image's `PYTHONPATH`.
-- `scripts/` — FlashInfer pruning for the vLLM image; `scripts/check_markdown.py` enforces the Markdown rules below.
+- `scripts/` — FlashInfer pruning for the vLLM image; `scripts/check_markdown.py` enforces the Markdown rules below; `txt2mp3.py`/`txt2m4b.py` (with `tts_client.py`) narrate text through TTS and run outside the image.
 - `tests/` — CPU pytest suite. `pyproject.toml`/`uv.lock` are the dev environment only, not an image.
 
 ## Rules
@@ -18,7 +18,7 @@ Two container images for the homelab Ray clusters: `hangxie/ray-vllm` (Ray with 
 - **Replica settings go through `bind()`.** Read settings on the head (`settings()`) and pass them to `.bind()`; module-level globals must not decide replica behavior. Don't give a deployment its own `runtime_env`: it replaces the application's, so replicas would lose its `env_vars` (e.g. `HF_HUB_OFFLINE`).
 - **CUDA graphs.** `cuda_graphs.py` must match qwen-tts's eager path (`tests/test_cuda_graphs.py`). Sampling, the end-of-speech hook and the disconnect check stay outside captured graphs; `TTS_CUDA_GRAPHS=0` decodes eagerly.
 - **Target GPUs.** The vLLM image's FlashInfer modules are pruned to `FLASHINFER_KEEP_ARCHS` (default `8.6`, the RTX 3050s); widen it before deploying elsewhere. TTS peaks at 5.37 of 6 GB, so check `X-Peak-CUDA-GB` after changes that add GPU memory.
-- **HTTP surface.** Existing routes, fields, error codes, `X-*` headers and NDJSON events are a contract with site-up's TTS page, `txt2mp3.sh` and voice chat page, and with OpenAI clients (`/v1/audio/speech`, `/v1/audio/transcriptions`). STT's page stays a plain uploader; live features go in the meeting app, which redeploys without reloading Whisper.
+- **HTTP surface.** TTS and STT speak OpenAI's APIs (`/v1/audio/speech`, `/v1/audio/transcriptions`, `/v1/models`) for OpenAI clients; this repo's own clients (the pages, voice chat, meeting notes, `scripts/tts_client.py`) use them too and change with them in the same PR. Extensions stay under `/v1` and in OpenAI's shapes: extra request fields, `X-*` headers, `/v1/health`, `/v1/audio/voices`, and STT's `/v1/audio/stream` until `/v1/realtime` replaces it (#35). STT's page stays a plain uploader; live features go in the meeting app, which redeploys without reloading Whisper.
 - **No auth in the image.** The deployment authenticates in front of the Serve apps; apps only log the identity headers it sets.
 - **Versions and labels.** Both images share one version stream. Test candidates are image tags `vX.Y.Z-rcN` only. A release is git tag `vX.Y.Z` on the merged commit plus both images rebuilt from cache with `VERSION=vX.Y.Z`, so only the version label (and the voice image's `serve/VERSION`) differ from the tested rc; the release notes say which image changed.
 - **Fix in place.** No parallel versions, shims, or `v2` copies.

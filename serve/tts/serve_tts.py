@@ -1,7 +1,8 @@
 """Ray Serve voice-cloning service using Qwen3-TTS Base (qwen-tts / PyTorch on CUDA).
 
-Port of site-up's ai/mlx-voice-svc with the same HTTP surface. Serve builds the application on the head, which only
-needs the routes, and pickles it; torch, transformers and qwen_tts load inside the replica.
+OpenAI's speech API (`POST /v1/audio/speech`, whole clips or streamed as raw audio or SSE) plus `GET /v1/health`,
+`/v1/audio/voices`, `/v1/models` and the test page at `/`. Serve builds the application on the head, which only needs
+the routes, and pickles it; torch, transformers and qwen_tts load inside the replica.
 """
 
 import asyncio
@@ -13,6 +14,7 @@ import io
 import json
 import logging
 import os
+import struct
 import threading
 import time
 from pathlib import Path
@@ -68,6 +70,12 @@ OPENAI_FORMATS = {
     "wav": ("WAV", "PCM_16", "audio/wav"),
     "pcm": (None, None, "audio/pcm"),
 }
+# Formats a streamed response (stream_format audio or sse) can use: it starts before the clip's length is known, and
+# libsndfile fills in a FLAC header only on close, after a stream has sent it.
+STREAM_FORMATS = ("mp3", "opus", "wav", "pcm")
+# A streamed MP3 is constant bitrate (about 80 kb/s at 24 kHz): it has no Xing header, which libsndfile writes on close,
+# and readers estimate a VBR stream's length from its first frame.
+STREAM_MP3_COMPRESSION = 0.5
 
 logger = logging.getLogger("ray.serve")
 api = FastAPI()
@@ -76,11 +84,7 @@ api.add_middleware(CallerLog)
 
 @api.exception_handler(HTTPException)
 async def http_error(request, exc):
-    return JSONResponse(
-        {"error": "Not found" if exc.status_code == 404 else str(exc.detail)},
-        exc.status_code,
-        headers={"Cache-Control": "no-store"},
-    )
+    return openai_error(exc.status_code, "Not found" if exc.status_code == 404 else str(exc.detail))
 
 
 class TextTooLong(ValueError):
@@ -113,6 +117,50 @@ def encode(audio, sample_rate, response_format):
     output = io.BytesIO()
     sf.write(output, audio, sample_rate, format=container, subtype=subtype)
     return output.getvalue(), media_type
+
+
+def wav_header(sample_rate):
+    """A 16-bit mono WAV header for a stream of unknown length: RIFF and data sizes at their maximum, as readers
+    expect from a WAV that is still being written."""
+    fmt = struct.pack("<HHIIHH", 1, 1, sample_rate, 2 * sample_rate, 2, 16)
+    return b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " + struct.pack("<I", 16) + fmt + b"data\xff\xff\xff\xff"
+
+
+class StreamEncoder:
+    """Encodes a streamed clip as it is generated: `feed` takes 16-bit PCM and returns the bytes ready to send, `close`
+    the rest. libsndfile writes into a buffer and each call sends what it has appended since."""
+
+    def __init__(self, response_format, sample_rate):
+        self.file, self.head = None, b""
+        if response_format == "wav":
+            self.head = wav_header(sample_rate)
+        elif response_format != "pcm":
+            import soundfile as sf
+
+            container, subtype, _ = OPENAI_FORMATS[response_format]
+            mp3 = container == "MP3"
+            extra = {"bitrate_mode": "CONSTANT", "compression_level": STREAM_MP3_COMPRESSION} if mp3 else {}
+            self.buffer, self.sent = io.BytesIO(), 0
+            self.file = sf.SoundFile(self.buffer, "w", sample_rate, 1, subtype, format=container, **extra)
+
+    def feed(self, pcm):
+        if self.file is None:
+            data, self.head = self.head + pcm, b""
+            return data
+        self.file.write(np.frombuffer(pcm, dtype="<i2"))
+        return self.drain()
+
+    def close(self):
+        if self.file is None:
+            return b""
+        self.file.close()
+        return self.drain()
+
+    def drain(self):
+        with self.buffer.getbuffer() as view:  # released before libsndfile writes again, so the buffer can grow
+            data = bytes(view[self.sent :])
+        self.sent += len(data)
+        return data
 
 
 def reply(status, body, media_type="application/json", headers=None):
@@ -301,7 +349,7 @@ class Streamer:
         self.clipped += int(np.count_nonzero(np.abs(audio) > PEAK_CEILING))
         pcm = np.round(np.clip(audio, -PEAK_CEILING, PEAK_CEILING) * 32767).astype("<i2")
         self.first = self.first or time.perf_counter()
-        self.emit({"type": "audio", "sample_rate": self.sample_rate, "pcm": base64.b64encode(pcm.tobytes()).decode()})
+        self.emit({"type": "audio", "pcm": pcm.tobytes()})
 
 
 def hook_talker(model, current, prepare=None):
@@ -471,7 +519,7 @@ class TTS:
         page = (ROOT / "index.html").read_text().replace("{{VERSION}}", html.escape(VERSION))
         return reply(200, page.encode(), "text/html; charset=utf-8")
 
-    @api.get("/health")
+    @api.get("/v1/health")
     def health(self):
         return reply(
             200,
@@ -491,66 +539,51 @@ class TTS:
             },
         )
 
-    @api.get("/voices")
+    @api.get("/v1/audio/voices")
     def list_voices(self):
-        return reply(200, voices(self.voices_dir))
+        """The voices as OpenAI-style TTS servers list them, for clients such as Open WebUI that ask."""
+        return reply(200, {"voices": [{"id": name, "name": name} for name in voices(self.voices_dir)]})
 
-    @api.post("/api/tts")
-    async def synthesize(self, request: Request):
-        try:
-            req = await request_json(request)
-            options = self.options(req)
-        except TextTooLong as exc:
-            return reply(413, {"error": str(exc), "tokens": exc.tokens, "limit": exc.limit})
-        except (ValueError, TypeError, KeyError, AttributeError) as exc:
-            return reply(400, {"error": str(exc)})
-        if options.pop("stream"):
-            options.pop("speed")
-            return self.stream_speech(**options)
-        try:
-            return reply(200, *await self.clip(options, "wav", "/api/tts"))
-        except Exception as exc:
-            return reply(500, {"error": str(exc)})
+    @api.get("/v1/models")
+    def models(self):
+        return reply(200, {"object": "list", "data": [{"id": self.model_id, "object": "model", "owned_by": "local"}]})
 
     @api.post("/v1/audio/speech")
-    async def openai_speech(self, request: Request):
-        """OpenAI's speech API over the same synthesis: `input`, `voice`, `response_format` and `speed` map onto
-        /api/tts's fields, and /api/tts's other fields are accepted too. `model` and `instructions` are ignored."""
+    async def speech(self, request: Request):
+        """OpenAI's speech API: `input`, `voice`, `response_format`, `speed` and `stream_format`, plus this service's
+        own fields (`seed`, `language`, `volume`, sampling). `model` and `instructions` are ignored.
+
+        Without `stream_format` the answer is the whole clip with `X-*` timing headers. `audio` streams the clip's bytes
+        as they are generated, and `sse` sends them as `speech.audio.delta` events followed by `speech.audio.done`.
+        """
         try:
             req = await request_json(request)
             if not isinstance(req, dict):
                 raise ValueError("Request must be a JSON object")
             response_format = req.get("response_format", "mp3")
+            stream_format = req.get("stream_format")
             if response_format not in OPENAI_FORMATS:
                 raise ValueError(f"response_format must be one of: {', '.join(OPENAI_FORMATS)}")
-            if req.get("stream_format", "audio") != "audio":
-                raise ValueError("stream_format must be audio")
-            if req.get("stream", False) is not False:
-                raise ValueError("stream must be false")
-            fields = {k: v for k, v in req.items() if k not in ("input", "model", "instructions", "stream_format")}
-            options = self.options({**fields, "text": req["input"]})
-            options.pop("stream")
+            if stream_format not in (None, "audio", "sse"):
+                raise ValueError("stream_format must be audio or sse")
+            if stream_format and response_format not in STREAM_FORMATS:
+                raise ValueError(f"A streamed response_format must be one of: {', '.join(STREAM_FORMATS)}")
+            options = self.options(req, stream=stream_format is not None)
         except KeyError as exc:
             return openai_error(400, f"Missing field {exc}")
         except TextTooLong as exc:
             return openai_error(413, str(exc))
         except (ValueError, TypeError, AttributeError) as exc:
             return openai_error(400, str(exc))
+        if stream_format:
+            return await self.stream_speech(options, response_format, stream_format)
+        options.pop("text_tokens")
         try:
-            return reply(200, *await self.clip(options, response_format, "/v1/audio/speech"))
+            return reply(200, *await self.clip(options, response_format))
         except Exception as exc:
             return openai_error(500, str(exc), "server_error")
 
-    @api.get("/v1/audio/voices")
-    def openai_voices(self):
-        """The voices as OpenAI-style TTS servers list them, for clients such as Open WebUI that ask."""
-        return reply(200, {"voices": [{"id": name, "name": name} for name in voices(self.voices_dir)]})
-
-    @api.get("/v1/audio/models")
-    def openai_models(self):
-        return reply(200, {"models": [{"id": self.model_id}]})
-
-    async def clip(self, options, response_format, route):
+    async def clip(self, options, response_format):
         """generate() in a worker thread; returns reply()'s body, media type and headers.
 
         Shielded so a cancellation reaches the except below while generation keeps running until it sees the event.
@@ -565,7 +598,7 @@ class TTS:
             # Serve cancels the request when the HTTP client disconnects. Wait for generation to stop at the next codec
             # frame so this replica is idle before Serve routes it the next queued request.
             job.stop.set()
-            logger.info("POST %s abandoned: client disconnected", route)
+            logger.info("POST /v1/audio/speech abandoned: client disconnected")
             with contextlib.suppress(Exception):
                 await task
             raise
@@ -573,15 +606,15 @@ class TTS:
             logger.exception("Synthesis failed")
             raise
 
-    def options(self, req):
-        """Validate /api/tts's fields; returns generate()'s arguments plus `stream`. Raises ValueError (TextTooLong
-        when the text can't fit in max_tokens) or the TypeError, KeyError or AttributeError of a malformed field."""
-        text, voice = req["text"], req["voice"]
+    def options(self, req, stream=False):
+        """Validate a speech request's fields; returns generate()'s arguments plus `text_tokens`. Raises ValueError
+        (TextTooLong when the text can't fit in max_tokens) or the TypeError, KeyError or AttributeError of a
+        malformed field."""
+        text, voice = req["input"], req["voice"]
         seed = int(req.get("seed", 0))
         speed = float(req.get("speed", SPEED_DEFAULT))
         volume = float(req.get("volume", VOLUME_DEFAULT))
         language = req.get("language", "auto")
-        stream = req.get("stream", False)
         sampling = {name: d if req.get(name) is None else t(req[name]) for name, (t, d, _, _) in self.sampling.items()}
         if not isinstance(text, str) or not text.strip() or len(text) > 20_000:
             raise ValueError("Enter between 1 and 20000 characters")
@@ -589,8 +622,6 @@ class TTS:
             raise ValueError("Select a reference voice with an exact transcript")
         if not 0 <= seed < 2**32:
             raise ValueError("Seed must be between 0 and 4294967295")
-        if not isinstance(stream, bool):
-            raise ValueError("stream must be true or false")
         if stream and speed != SPEED_DEFAULT:
             raise ValueError("speed is not supported when streaming")
         if not SPEED_MIN <= speed <= SPEED_MAX:
@@ -618,43 +649,85 @@ class TTS:
             "volume": volume,
             "language": language,
             "sampling": sampling,
-            "stream": stream,
+            "text_tokens": text_tokens,
         }
 
-    def stream_speech(self, text, voice, seed, volume, language, sampling):
-        """Reply with NDJSON as speech is generated: an `audio` line per piece of 16-bit PCM, then `done` or `error`."""
+    async def stream_speech(self, options, response_format, stream_format):
+        """Reply as speech is generated: the encoded bytes (`audio`) or SSE events (`sse`).
+
+        The reply starts with the first piece of audio, so a failure before it, such as an unreadable voice, is still
+        an error status. A failure after it is an SSE `error` event, or for raw audio a connection cut short.
+        """
         loop = asyncio.get_running_loop()
         events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         job = Job()
+        text_tokens = options.pop("text_tokens")
+        options.pop("speed")
 
         def emit(event):
             loop.call_soon_threadsafe(events.put_nowait, event)
 
-        task = asyncio.ensure_future(
-            asyncio.to_thread(self.generate_stream, text, voice, seed, volume, language, sampling, job, emit)
-        )
+        task = asyncio.ensure_future(asyncio.to_thread(self.generate_stream, **options, job=job, emit=emit))
+
+        async def finish(abandoned):
+            if abandoned:
+                # The client disconnected: stop at the next codec frame so this replica is idle before Serve routes it
+                # the next queued request.
+                job.stop.set()
+                logger.info("POST /v1/audio/speech stream abandoned: client disconnected")
+            with contextlib.suppress(Exception):
+                await asyncio.shield(task)
+
+        try:
+            first = await events.get()
+        except asyncio.CancelledError:
+            await finish(abandoned=True)
+            raise
+        if first["type"] == "error":
+            await finish(abandoned=False)
+            return openai_error(500, first["error"], "server_error")
+        sample_rate = self.tts.model.speech_tokenizer.get_output_sample_rate()
+        encoder = StreamEncoder(response_format, sample_rate)
+        sse = stream_format == "sse"
+
+        def delta(data):
+            return f"data: {json.dumps({'type': 'speech.audio.delta', 'audio': base64.b64encode(data).decode()})}\n\n"
 
         async def body():
-            finished = False
+            event, finished = first, False
             try:
                 while True:
-                    event = await events.get()
-                    yield json.dumps(event) + "\n"
-                    if event["type"] in ("done", "error"):
+                    if event["type"] == "audio":
+                        if data := encoder.feed(event["pcm"]):
+                            yield delta(data) if sse else data
+                    elif event["type"] == "done":
                         finished = True
+                        if data := encoder.close():
+                            yield delta(data) if sse else data
+                        if sse:
+                            stats = {k: v for k, v in event.items() if k not in ("type", "frames")}
+                            usage = {"input_tokens": text_tokens, "output_tokens": event["frames"]}
+                            usage["total_tokens"] = text_tokens + event["frames"]
+                            yield f"data: {json.dumps({'type': 'speech.audio.done', 'usage': usage, **stats})}\n\n"
                         break
+                    else:
+                        finished = True
+                        if not sse:
+                            raise RuntimeError(event["error"])  # ends the response unfinished, so the client sees it
+                        error = {"message": event["error"], "type": "server_error", "param": None, "code": None}
+                        yield f"data: {json.dumps({'type': 'error', 'error': error})}\n\n"
+                        break
+                    event = await events.get()
             finally:
                 # Not `task.done()`: the thread emits `done` just before it returns, so a finished stream usually still
                 # sees the task running here.
-                if not finished:
-                    # The client disconnected: stop at the next codec frame so this replica is idle before Serve routes
-                    # it the next queued request.
-                    job.stop.set()
-                    logger.info("POST /api/tts stream abandoned: client disconnected")
+                await finish(abandoned=not finished)
                 with contextlib.suppress(Exception):
-                    await asyncio.shield(task)
+                    encoder.close()
 
-        return StreamingResponse(body(), media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
+        media_type = "text/event-stream" if sse else OPENAI_FORMATS[response_format][2]
+        headers = {"Cache-Control": "no-store", "X-Sample-Rate": str(sample_rate)}
+        return StreamingResponse(body(), media_type=media_type, headers=headers)
 
     def generate_stream(self, text, voice, seed, volume, language, sampling, job, emit):
         """Synthesize a streamed request in a worker thread, emitting its events through a Streamer."""
@@ -694,6 +767,7 @@ class TTS:
                     "peak_cuda_gb": round(torch.cuda.max_memory_allocated() / 1e9, 2),
                     "gain_db": round(gain_db, 1),
                     "clipped_samples": streamer.clipped,
+                    "frames": streamer.sent,
                 }
             )
         except ClientGone:
@@ -729,7 +803,7 @@ class TTS:
             max_new_tokens=sampling["max_tokens"],
         )
 
-    def generate(self, text, voice, seed, speed, volume, language, sampling, job, response_format="wav"):
+    def generate(self, text, voice, seed, speed, volume, language, sampling, job, response_format):
         """Synthesize in a worker thread; returns reply()'s body, media type and headers."""
         import torch
 

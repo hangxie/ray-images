@@ -1,11 +1,12 @@
 """Ray Serve voice chat: speech -> STT -> streamed LLM reply -> TTS per sentence, streamed back to the browser.
 
 Port of site-up's media/voice-chat with the same HTTP surface: `GET /` (chat.html), `GET /health`, `GET /api/voices`,
-and `POST /api/chat` answering NDJSON events. It holds no models: STT, the LLM, and TTS are URLs, so replicas need a CPU
-and the system Python only. The pipeline is the original's: worker threads talk to the backends with http.client, and
-an interrupted turn shuts their sockets. What changed is the server (a FastAPI ingress instead of http.server, with
-Serve cancelling the response when the client disconnects), settings (read on the head and passed through bind()), and
-the client-IP allowlist, which is gone: access control belongs to the deployment in front, as for TTS and STT.
+and `POST /api/chat` answering NDJSON events. It holds no models: STT, the LLM, and TTS are URLs (all OpenAI-style `/v1`
+APIs), so replicas need a CPU and the system Python only. The pipeline is the original's: worker threads talk to the
+backends with http.client, and an interrupted turn shuts their sockets. What changed is the server (a FastAPI ingress
+instead of http.server, with Serve cancelling the response when the client disconnects), settings (read on the head and
+passed through bind()), and the client-IP allowlist, which is gone: access control belongs to the deployment in front,
+as for TTS and STT.
 """
 
 import asyncio
@@ -47,9 +48,10 @@ SYSTEM_PROMPT = (
 HISTORY_MESSAGES = 20  # earlier turns are dropped so prompt processing stays short
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
 BACKEND_TIMEOUT = 120
-# mlx-tts-svc answers 409 and Ray Serve 503/429 while busy, such as during a txt2m4b run; wait this long for a slot.
+# Ray Serve answers 503 (or 429) while TTS is busy, such as during a txt2m4b run; wait this long for a slot.
 TTS_BUSY_WAIT = 20
-TTS_BUSY_STATUSES = (409, 429, 503)
+TTS_BUSY_STATUSES = (429, 503)
+TTS_SAMPLE_RATE = 24000  # OpenAI's pcm rate, for a TTS that doesn't send X-Sample-Rate
 POOL_IDLE_PER_ORIGIN = 8  # idle keep-alive connections kept per backend; more are closed
 DRAIN_TIMEOUT = 5  # how long to wait for the rest of a TTS stream after its `done` before giving up on reuse
 
@@ -103,7 +105,7 @@ def settings():
         "llm_url": env("CHAT_LLM_URL", "http://localhost:8080/v1").rstrip("/"),
         "llm_model": env("CHAT_LLM_MODEL", "qwen3.5-9b-q8-uncensored"),
         "llm_max_tokens": int(env("CHAT_LLM_MAX_TOKENS", "512")),
-        "tts_url": env("CHAT_TTS_URL", "http://localhost:5004").rstrip("/"),
+        "tts_url": env("CHAT_TTS_URL", "http://localhost:5004/v1").rstrip("/"),
         "voice": env("CHAT_VOICE", ""),
         "system_prompt": env("CHAT_SYSTEM_PROMPT") or SYSTEM_PROMPT,
         # Sent as `Authorization: Bearer` to that backend; empty sends none.
@@ -414,8 +416,8 @@ def run_llm(config, turn, messages, chunks):
 def run_tts(config, turn, chunks, voice, language):
     """Synthesize chunks one at a time, in order, since a TTS replica serves one request at a time.
 
-    Each chunk is requested as a stream and its audio forwarded piece by piece as it is generated, so playback starts
-    about a second into the chunk instead of after all of it. A backend that answers with a whole WAV still works.
+    Each chunk is requested as an SSE stream of 16-bit PCM and its audio forwarded piece by piece as it is generated,
+    so playback starts about a second into the chunk instead of after all of it.
     """
     failed = False
     try:
@@ -423,13 +425,14 @@ def run_tts(config, turn, chunks, voice, language):
         while (text := chunks.get()) is not None:
             if failed or turn.cancelled.is_set():
                 continue  # drain until the LLM worker finishes
-            body = json.dumps({"text": text, "voice": voice, "language": language, "stream": True}).encode()
+            request = {"input": text, "voice": voice, "language": language, "response_format": "pcm"}
+            body = json.dumps({**request, "stream_format": "sse"}).encode()
             deadline = time.monotonic() + TTS_BUSY_WAIT
             try:
                 while True:
                     try:
                         connection, response = turn.request(
-                            "TTS", f"{config['tts_url']}/api/tts", body, "application/json"
+                            "TTS", f"{config['tts_url']}/audio/speech", body, "application/json"
                         )
                         break
                     except BackendError as exc:
@@ -441,21 +444,10 @@ def run_tts(config, turn, chunks, voice, language):
                             raise
                         time.sleep(0.3)
                 try:
-                    if response.getheader("Content-Type", "").startswith("application/x-ndjson"):
-                        if stream_tts(turn, response, index, text):
-                            finish(connection, response)
-                    else:
-                        wav = response.read()
-                        rtf = response.getheader("X-RTF")
-                        seconds = response.getheader("X-Audio-Seconds")
-                        turn.emit(
-                            type="audio",
-                            index=index,
-                            text=text,
-                            wav=base64.b64encode(wav).decode(),
-                            seconds=float(seconds) if seconds else None,
-                            rtf=float(rtf) if rtf else None,
-                        )
+                    if not response.getheader("Content-Type", "").startswith("text/event-stream"):
+                        raise BackendError("TTS", response.status, "answered without an event stream")
+                    if stream_tts(turn, response, index, text):
+                        finish(connection, response)
                 finally:
                     turn.close(connection, response)
                 index += 1
@@ -479,27 +471,31 @@ def finish(connection, response):
 def stream_tts(turn, response, index, text):
     """Forward each streamed piece of 16-bit PCM as an `audio` event; the chunk's text rides on its first piece.
 
-    True once the stream's `done` arrives, False when the turn was cancelled first."""
+    True once the stream's `speech.audio.done` arrives, False when the turn was cancelled first."""
+    sample_rate = int(response.getheader("X-Sample-Rate") or TTS_SAMPLE_RATE)
     part = 0
     for line in response:
         if turn.cancelled.is_set():
             return False
-        event = json.loads(line)
-        if event["type"] == "audio":
-            seconds = len(base64.b64decode(event["pcm"])) / 2 / event["sample_rate"]
+        if not line.startswith(b"data:"):
+            continue  # the blank line ending each event
+        event = json.loads(line[5:])
+        if event["type"] == "speech.audio.delta":
+            pcm = event["audio"]
+            seconds = len(base64.b64decode(pcm)) / 2 / sample_rate
             turn.emit(
                 type="audio",
                 index=index,
                 part=part,
                 text=text if part == 0 else None,
-                pcm=event["pcm"],
-                sample_rate=event["sample_rate"],
+                pcm=pcm,
+                sample_rate=sample_rate,
                 seconds=round(seconds, 2),
             )
             part += 1
         elif event["type"] == "error":
-            raise BackendError("TTS", 500, event["error"])
-        elif event["type"] == "done":
+            raise BackendError("TTS", 500, event["error"]["message"])
+        elif event["type"] == "speech.audio.done":
             return True
     raise BackendError("TTS", 502, "stream ended without finishing")
 
@@ -590,10 +586,11 @@ class Chat:
     @api.get("/api/voices")
     async def voices(self):
         try:
-            voices = await asyncio.to_thread(tts_get, self.pool, self.config, "/voices")
-            if not isinstance(voices, list) or not all(isinstance(v, str) for v in voices):
-                raise ValueError("TTS /voices is not a list of names")
-        except (OSError, ValueError, BackendError) as exc:
+            listed = await asyncio.to_thread(tts_get, self.pool, self.config, "/audio/voices")
+            voices = [v["id"] for v in listed["voices"]]
+            if not all(isinstance(v, str) for v in voices):
+                raise ValueError("TTS /audio/voices has a voice without a string id")
+        except (OSError, ValueError, TypeError, KeyError, BackendError) as exc:
             return reply(502, {"error": f"TTS unavailable: {exc}"})
         default = self.config["voice"]
         return reply(
