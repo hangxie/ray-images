@@ -2,9 +2,9 @@
 
 Port of site-up's ai/mlx-stt-svc with the same HTTP surface under /v1, plus a plain recording page at `GET /` (stt.html)
 and a WebSocket at `/v1/audio/stream` that transcribes a live recording as it goes, for serve_meeting's page. The routes
-carry /v1 themselves, so the app mounts at `/` (or any prefix) with the page at its root. It runs in the TTS
-virtualenv beside serve_tts, which already has transformers (4.57.3, with Whisper), soundfile and scipy; the stream
-adds only silero-vad. As in serve_tts, module-level imports are limited to what both environments have.
+carry /v1 themselves, so the app mounts at `/` (or any prefix) with the page at its root. It shares the voice image
+with serve_tts, whose transformers (4.57.3, with Whisper), soundfile and scipy already cover transcription; the stream
+adds only silero-vad. As in serve_tts, torch and transformers load inside the replica.
 """
 
 import asyncio
@@ -67,13 +67,6 @@ def settings():
         "model": os.environ.get("STT_MODEL", "openai/whisper-large-v3-turbo"),
         "model_dir": os.environ.get("STT_MODEL_DIR"),  # local copy of the model; the Hub ID is used when unset
     }
-
-
-def replica_runtime_env():
-    """The voice virtualenv's interpreter, plus the build environment's HF_* variables (e.g. HF_HUB_OFFLINE)."""
-    env_vars = {name: value for name, value in os.environ.items() if name.startswith("HF_")}
-    runtime_env = {"py_executable": os.environ.get("STT_PYTHON", "/home/ray/voice-venv/bin/python")}
-    return {**runtime_env, "env_vars": env_vars} if env_vars else runtime_env
 
 
 def multipart_fields(content_type, body):
@@ -224,7 +217,7 @@ def control(message):
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 1, "runtime_env": replica_runtime_env()},
+    ray_actor_options={"num_gpus": 1},
     num_replicas=int(os.environ.get("STT_NUM_REPLICAS", "1")),
     # A live stream holds its request for as long as it lasts, so several run at once and self.gpu takes
     # transcriptions one at a time. Utterances take well under a second, so requests wait instead of failing; past

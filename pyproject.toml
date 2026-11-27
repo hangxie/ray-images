@@ -1,6 +1,6 @@
-# Development environment for linting and CPU tests (`make setup`). The image itself is built by the Dockerfile with
-# pip; this mirrors the voice virtualenv (system Ray + torch, qwen-tts's transformers 4.57.3) closely enough to import
-# and exercise the Serve apps and the CUDA-graph bodies on CPU.
+# Development environment for linting and CPU tests (`make dev`). The images are built by docker/*/Dockerfile with
+# pip; this mirrors the voice image (Ray, torch, qwen-tts's transformers 4.57.3) closely enough to import and exercise
+# the Serve apps and the CUDA-graph bodies on CPU.
 [project]
 name = "ray-images"
 version = "0"
@@ -11,7 +11,7 @@ dependencies = [
     "scipy>=1.14.0",
     "silero-vad==6.3",
     "soundfile",
-    # The image's versions: vLLM 0.27.0 pins torch, torchaudio and fastapi in the system environment
+    # The voice image's versions (docker/voice/Dockerfile; tests/test_pins.py); fastapi comes with its Ray base
     "fastapi>=0.133.0,<0.137.0",
     "torch==2.13.0",
     "torchaudio==2.11.0",
@@ -63,8 +63,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["serve/common", "serve/tts", "serve/stt", "serve/chat", "serve/meeting", "serve", "scripts"]
-addopts = ["-ra", "--strict-markers", "-m", "not network"]
-markers = ["network: reads PyPI; run by `make pins`, not `make test`"]
+addopts = ["-ra", "--strict-markers"]
 filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore:Using `httpx` with `starlette.testclient` is deprecated",

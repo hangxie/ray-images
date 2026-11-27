@@ -1,9 +1,7 @@
 """Ray Serve voice-cloning service using Qwen3-TTS Base (qwen-tts / PyTorch on CUDA).
 
-Port of site-up's ai/mlx-voice-svc with the same HTTP surface. Serve builds the application on the head with the
-image's system Python, whose transformers is vLLM's 5.x; replicas run in the voice virtualenv (transformers 4.57.3 for
-qwen-tts) through runtime_env py_executable. Module-level imports are therefore limited to what both environments
-have; torch, transformers and qwen_tts load inside the replica.
+Port of site-up's ai/mlx-voice-svc with the same HTTP surface. Serve builds the application on the head, which only
+needs the routes, and pickles it; torch, transformers and qwen_tts load inside the replica.
 """
 
 import asyncio
@@ -127,8 +125,8 @@ def reply(status, body, media_type="application/json", headers=None):
 def settings():
     """Replica settings, read where Serve builds the app (the head), which has the application's env_vars.
 
-    They reach the replica as TTS.bind() arguments: a deployment's runtime_env replaces the application's, so the
-    replica process does not see the application's env_vars, and module-level globals there would fall back to defaults.
+    They reach the replica as TTS.bind() arguments, so the values the head read are the ones replicas use; module-level
+    globals would be re-read in each replica process instead.
     """
     return {
         "model": os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
@@ -139,13 +137,6 @@ def settings():
         # Frames of reference + speech the decoder transformer sees per streamed piece; qwen-tts decodes 300 at once.
         "stream_context_frames": int(os.environ.get("TTS_STREAM_CONTEXT_FRAMES", "300")),
     }
-
-
-def replica_runtime_env():
-    """The voice virtualenv's interpreter, plus the build environment's HF_* variables (e.g. HF_HUB_OFFLINE)."""
-    env_vars = {name: value for name, value in os.environ.items() if name.startswith("HF_")}
-    runtime_env = {"py_executable": os.environ.get("TTS_PYTHON", "/home/ray/voice-venv/bin/python")}
-    return {**runtime_env, "env_vars": env_vars} if env_vars else runtime_env
 
 
 def voices(directory):
@@ -386,7 +377,7 @@ def hook_talker(model, current, prepare=None):
 
 
 @serve.deployment(
-    ray_actor_options={"num_gpus": 1, "resources": {"tts": 1}, "runtime_env": replica_runtime_env()},
+    ray_actor_options={"num_gpus": 1, "resources": {"tts": 1}},
     num_replicas=int(os.environ.get("TTS_NUM_REPLICAS", "2")),
     # One synthesis per replica: Serve queues the rest and routes each to an idle replica. A backlog beyond
     # max_queued_requests fails fast with 503 instead of growing without bound.

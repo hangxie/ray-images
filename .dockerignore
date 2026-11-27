@@ -1,7 +1,7 @@
-# The Dockerfile copies only scripts/ and serve/; keep the rest, above all the 1.5 GB dev .venv, out of the build context
+# Both Dockerfiles build from the repository root and copy only these; keep the rest, above all the 1.5 GB dev .venv,
+# out of the build context
 *
 !scripts/prune_flashinfer_cache.py
-!serve/check_requirements.py
 !serve/common/
 !serve/tts/
 !serve/stt/
