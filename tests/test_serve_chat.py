@@ -8,6 +8,7 @@ import asyncio
 import base64
 import http.client
 import json
+import logging
 import socket
 import threading
 import time
@@ -587,3 +588,27 @@ def test_timeout_on_a_pooled_connection_is_not_retried(client, backends, replica
     assert events[0]["type"] == "error" and events[0]["stage"] == "stt"
     assert backends.sent("stt") == []  # not resent to a new connection
     listener.close()
+
+
+CALLER = {"X-Consumer": "svc", "X-Auth-Request-Email": "a@example.com", "Authorization": "Bearer secret"}
+
+
+def caller_lines(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "ray.serve" and r.getMessage().endswith(" email=a@example.com")
+    ]
+
+
+def test_caller_is_logged(client, caplog):
+    caplog.set_level(logging.INFO, "ray.serve")
+    assert client.get("/health", headers=CALLER).status_code == 200
+    assert (
+        client.post("/api/chat", content=b"x" * 101, headers={**CALLER, "Content-Type": "application/json"}).status_code
+        == 400
+    )
+    health, chat = caller_lines(caplog)
+    assert health.startswith("GET /health 200 ") and health.endswith(" consumer=svc email=a@example.com")
+    assert chat.startswith("POST /api/chat 400 ")
+    assert "secret" not in caplog.text

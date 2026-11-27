@@ -5,6 +5,7 @@ The routes, multipart parsing, audio loading, segmenting and validation are the 
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 from typing import Any, cast
 
@@ -432,3 +433,26 @@ def test_stream_ignores_other_text_messages(client, replica):
         assert ws.receive_json()["type"] == "segment"
         assert ws.receive_json() == {"type": "done"}
     assert replica.calls[0][0].size == 16000
+
+
+CALLER = {"X-Consumer": "svc", "X-Auth-Request-Email": "a@example.com", "Authorization": "Bearer secret"}
+
+
+def caller_lines(caplog):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.name == "ray.serve" and r.getMessage().endswith(" email=a@example.com")
+    ]
+
+
+def test_caller_is_logged(client, caplog):
+    caplog.set_level(logging.INFO, "ray.serve")
+    assert client.get("/v1/health", headers=CALLER).status_code == 200
+    with client.websocket_connect("/v1/audio/stream", headers=CALLER) as ws:
+        ws.send_text(json.dumps({"type": "stop"}))
+        assert ws.receive_json() == {"type": "done"}
+    health, stream = caller_lines(caplog)
+    assert health.startswith("GET /v1/health 200 ") and health.endswith(" consumer=svc email=a@example.com")
+    assert stream.startswith("WS /v1/audio/stream accepted ")
+    assert "secret" not in caplog.text
