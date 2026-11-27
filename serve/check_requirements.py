@@ -1,6 +1,6 @@
 """Check that the given requirements and all their dependencies are satisfied for this interpreter.
 
-Stands in for `pip check` in the TTS virtualenv: that venv inherits the system packages, so `pip check` there also
+Stands in for `pip check` in the voice virtualenv: that venv inherits the system packages, so `pip check` there also
 reports vLLM's transformers>=5 requirement against the venv's transformers 4.57.3, which is the point of the venv.
 Distributions resolve in import order, so a venv package shadows the system one, as it does at runtime.
 """
