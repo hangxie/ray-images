@@ -22,6 +22,7 @@ Two container images for the homelab Ray clusters: `hangxie/ray-vllm` (Ray with 
 - **No auth in the image.** The deployment authenticates in front of the Serve apps; apps only log the identity headers it sets.
 - **Versions and labels.** Both images share one version stream. Test candidates are image tags `vX.Y.Z-rcN` only. A release is git tag `vX.Y.Z` on the merged commit plus both images rebuilt from cache with `VERSION=vX.Y.Z`, so only the version label (and the voice image's `serve/VERSION`) differ from the tested rc; the release notes say which image changed.
 - **Fix in place.** No parallel versions, shims, or `v2` copies.
+- **Comments.** Only where the code can't speak for itself: one terse line on why, as a fragment, not a story. Docstrings are a one-line summary plus anything surprising. Longer rationale goes in `README.md`.
 - **Docs.** `README.md` records *why* for non-obvious choices. Markdown prose has no hard line breaks (one line per paragraph or list item) and no tabs.
 - **Commits.** Imperative subject under 72 chars, body at most one line; rationale, testing and `Closes #N` go in the PR. No AI/agent attribution anywhere.
 
