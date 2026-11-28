@@ -1,15 +1,10 @@
-"""CUDA-graph decoding for qwen-tts's talker and code predictor.
+"""CUDA-graph decoding for qwen-tts's talker and code predictor, whose tiny eager steps are launch-bound.
 
-Each audio frame takes one talker step plus 15 code-predictor steps, all tiny batch-1 forward passes, so eager HF
-generate is bound by Python and kernel-launch overhead rather than the GPU. This module replays them as CUDA graphs:
+- The code predictor's per-frame decode (prefill, 14 steps, sampling) is one graph, replacing `code_predictor.generate`.
+- The talker's one-token step is one graph over a fixed-size KV cache. HF generate still drives the loop, so logits
+  processors and stopping criteria run outside the graph; prefill stays eager.
 
-- The code predictor's whole per-frame decode (2-token prefill, 14 steps, sampling) is one graph. It replaces
-  `code_predictor.generate`, whose result the talker only reads `.sequences` from.
-- The talker's decode step (the 28-layer `talker.model` forward for one token) is one graph over a fixed-size KV
-  cache. HF generate still drives the talker loop, so logits processors (repetition penalty, the end-of-speech hook)
-  and stopping criteria (client disconnect) run once per frame outside the graph. Prefill stays eager.
-
-On CPU (tests) the same bodies run eagerly without capture. Imported only inside the replica.
+On CPU (tests) the same bodies run eagerly. Imported only inside the replica.
 """
 
 import time
@@ -22,11 +17,7 @@ from transformers.modeling_outputs import BaseModelOutputWithPast
 
 
 class GraphCache(StaticCache):
-    """StaticCache that generate treats as non-compileable.
-
-    A compileable cache makes generate auto-compile the forward and pass a 4D attention mask, but the talker derives
-    its rotary positions from the 2D mask at prefill.
-    """
+    """StaticCache that generate won't auto-compile, whose 4D mask would break the talker's rotary positions."""
 
     @property
     def is_compileable(self):
@@ -34,10 +25,7 @@ class GraphCache(StaticCache):
 
 
 def sample(logits, do_sample, top_k, top_p, temperature):
-    """Sample one token per row like HF's temperature → top-k → top-p warpers, with only graph-safe ops.
-
-    Gumbel-max replaces torch.multinomial: argmax(logits + Gumbel noise) is an exact categorical draw.
-    """
+    """Sample like HF's temperature → top-k → top-p warpers, graph-safe (Gumbel-max, not multinomial)."""
     logits = logits.float()
     if not do_sample:
         return logits.argmax(dim=-1)

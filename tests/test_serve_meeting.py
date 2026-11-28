@@ -1,7 +1,4 @@
-"""serve_meeting's page and stream relay, against serve_stt's real routes (with a fake Whisper) served on loopback.
-
-Everything but Whisper is real: the meeting routes, the websockets client, uvicorn, and STT's stream and segmenter.
-"""
+"""serve_meeting's page and relay against serve_stt's real routes, with a fake Whisper, on loopback."""
 
 import json
 import logging
@@ -24,8 +21,7 @@ import serve_stt
 
 
 class STTServer:
-    """serve_stt's app on a loopback port, recording each request's path, query and Authorization, and which
-    WebSocket handlers have returned."""
+    """serve_stt on loopback, recording each request's path, query and Authorization, and finished handlers."""
 
     def __init__(self, whisper):
         self.requests: list[tuple[str, str, str]] = []

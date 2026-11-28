@@ -1,5 +1,4 @@
-"""The uv environment the tests run in matches the voice image: its Dockerfile's version ARGs and the transformers
-version its build asserts. Both images build on the same Ray."""
+"""The uv environment matches the voice image's pins, and both images use the same Ray."""
 
 import re
 from importlib.metadata import version

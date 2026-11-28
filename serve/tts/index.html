@@ -40,9 +40,10 @@ const LABELS = {temperature: 'Temperature', top_k: 'Top-k', top_p: 'Top-p', repe
 let run, sampling = {}, speedDefault = 1, volumeDefault = -20;
 const describe = r => `${Number(r.audio_seconds).toFixed(2)} s audio in ${Number(r.wall_seconds).toFixed(2)} s · RTF ${Number(r.rtf).toFixed(3)}`;
 async function initialize() {
-  const [health, voices] = await Promise.all(['health', 'voices'].map(async url => {
+  const [health, listed] = await Promise.all(['v1/health', 'v1/audio/voices'].map(async url => {
     const response = await fetch(url); if (!response.ok) throw new Error('Unable to load test page data'); return response.json();
   }));
+  const voices = listed.voices.map(voice => voice.id);
   $('model').textContent = health.model + ' · ' + health.device;
   for (const language of health.languages) $('language').add(new Option(language, language));
   Object.assign($('speed'), {min: health.speed.min, max: health.speed.max, step: 0.05, value: health.speed.default});
@@ -59,9 +60,8 @@ async function initialize() {
   if (voices.includes('hang-en')) $('voice').value = 'hang-en';
   if (!voices.length) { $('submit').disabled = true; $('message').textContent = 'No reference WAVs with matching transcripts are available.'; }
 }
-// Android Chrome drops an in-flight request when the page goes to the background, and may leave it unsettled until the
-// page returns. A request that was in flight while hidden is resent on return, and a dropped or busy (503) one is retried
-// until Stop; the service abandons a synthesis whose client has gone, so the retry is not left waiting on it.
+// Android Chrome drops requests in the background: resend one that was in flight while hidden, and retry a dropped
+// or busy (503) one until Stop.
 async function synthesize(current, body, info) {
   for (let retry = false; ; retry = true) {
     if (retry) { info.textContent = 'Connection lost; retrying…'; await new Promise(resolve => setTimeout(resolve, 1000)); }
@@ -69,9 +69,9 @@ async function synthesize(current, body, info) {
     const attempt = current.attempt = new AbortController();
     attempt.hidden = document.hidden;
     try {
-      const response = await fetch('api/tts', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: AbortSignal.any([current.controller.signal, attempt.signal]), body});
-      if (response.status === 409 || response.status === 503) continue;
-      if (!response.ok) throw new Error((await response.json()).error);
+      const response = await fetch('v1/audio/speech', {method: 'POST', headers: {'Content-Type': 'application/json'}, signal: AbortSignal.any([current.controller.signal, attempt.signal]), body});
+      if (response.status === 503) continue;
+      if (!response.ok) throw new Error((await response.json()).error.message);
       return {response, blob: await response.blob()};
     } catch (error) {
       if (current.controller.signal.aborted || !(error instanceof TypeError || attempt.signal.aborted)) throw error;
@@ -106,7 +106,7 @@ $('form').addEventListener('submit', async event => {
   try {
     for (const [i, piece] of pieces.entries()) {
       items[i].info.textContent = 'Generating…';
-      const body = JSON.stringify({text: piece, voice: $('voice').value, seed: Number($('seed').value), speed: Number($('speed').value), volume: Number($('volume').value), language: $('language').value, ...Object.fromEntries(Object.keys(sampling).filter(name => $(name).value !== '').map(name => [name, Number($(name).value)]))});
+      const body = JSON.stringify({input: piece, voice: $('voice').value, response_format: 'wav', seed: Number($('seed').value), speed: Number($('speed').value), volume: Number($('volume').value), language: $('language').value, ...Object.fromEntries(Object.keys(sampling).filter(name => $(name).value !== '').map(name => [name, Number($(name).value)]))});
       const {response, blob} = await synthesize(current, body, items[i].info).catch(error => { throw error.name === 'AbortError' ? error : new Error(`Piece ${i + 1}: ${error.message}`); });
       const buffer = await context.decodeAudioData(await blob.arrayBuffer());
       if (run !== current) return;

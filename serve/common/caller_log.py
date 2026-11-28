@@ -1,11 +1,7 @@
-"""Log who made each request, as the deployment's proxy or authorizer reports it.
+"""Log who made each request, from the identity headers the deployment's proxy sets.
 
-The image has no auth (AGENTS.md, No auth in the image); the homelab Gateway's bearer check sets `X-Consumer`, and
-OAuth2 Proxy sets `X-Auth-Request-Email` as a Gateway auth check or `X-Forwarded-Email` as a reverse proxy in front of
-an app. Requests carrying any of them get one log line with the caller, the request and its outcome; Serve's own access
-log already covers the rest. `Authorization` is never read.
-
-Stdlib only, since the head imports it with the system Python.
+`X-Consumer` (Gateway bearer check), `X-Auth-Request-Email` or `X-Forwarded-Email` (OAuth2 Proxy). `Authorization` is
+never read. Stdlib only: the head imports it.
 """
 
 import logging
@@ -13,8 +9,7 @@ import time
 
 logger = logging.getLogger("ray.serve")
 
-# Header, as ASGI gives it (lower case), and the name it is logged under; for a name more than one header sets, the
-# first listed that the request carries wins.
+# ASGI (lower-case) header -> logged name; for a shared name, the first header present wins.
 IDENTITY_HEADERS = (
     (b"x-consumer", "consumer"),
     (b"x-auth-request-email", "email"),

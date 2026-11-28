@@ -10,7 +10,7 @@ Each app runs in its own Ray cluster, whose head and workers all use one image, 
 ```text
 docker/vllm/Dockerfile      hangxie/ray-vllm
 docker/voice/Dockerfile     hangxie/ray-voice
-scripts/                    build-time helpers (FlashInfer cache pruning)
+scripts/                    build-time helpers (FlashInfer cache pruning); txt2mp3, txt2m4b (see TTS)
 serve/tts/                  TTS Serve app (serve_tts.py, cuda_graphs.py, index.html), importable as serve_tts:app
 serve/stt/                  STT Serve app (serve_stt.py, stt.html), importable as serve_stt:app
 serve/chat/                 voice chat Serve app (serve_chat.py, chat.html), importable as serve_chat:app
@@ -92,14 +92,14 @@ TTS and STT run in the voice image's system Python. Its torch and torchaudio are
 
 ### Endpoints
 
-`GET /` (page), `GET /health`, `GET /voices`, and `POST /api/tts` keep the MLX service's fields, ranges, error codes, and headers, so its `index.html` and `txt2mp3.sh` work unchanged. Point `TTS_URL` at the new endpoint.
+TTS speaks OpenAI's speech API, so OpenAI clients such as Open WebUI's read-aloud use it with their OpenAI TTS base URL set to the app's prefix plus `/v1` (e.g. `/tts/v1`), separately from STT's: `GET /` (page), `POST /v1/audio/speech`, `GET /v1/audio/voices`, `GET /v1/models`, `GET /v1/health`. Errors use OpenAI's `{"error": {"message", "type", "param", "code"}}` shape, 404s included. The MLX service's `/api/tts`, `/health` and `/voices` are gone ([#34](https://github.com/hangxie/ray-images/issues/34)).
 
-- `X-Peak-CUDA-GB` replaces `X-Peak-MLX-GB`, and `/health` reports the CUDA device.
-- The page title and `/health` show the image tag from the `VERSION` file the build writes beside the app directories, as in [Voice chat](#voice-chat); STT's `/v1/health` reports it too.
-- The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`).
-- The page retries a 503 the way it retried the old 409.
-- `"stream": true` answers with NDJSON as the MLX service does (see [Streaming](#streaming)).
-- `POST /v1/audio/speech` is OpenAI's speech API over the same synthesis, for clients such as Open WebUI's read-aloud: point the client's OpenAI TTS base URL at the app's prefix plus `/v1` (e.g. `/tts/v1`), separately from STT's. `input`, `voice`, `speed` and `response_format` map onto `/api/tts`'s fields, and `/api/tts`'s other fields (`seed`, `language`, `volume`, sampling) are accepted too; `model` and `instructions` are ignored. `voice` must be one of this app's voices (`GET /v1/audio/voices`), not OpenAI's names, and `speed` keeps `/api/tts`'s 0.5–2.0 range rather than OpenAI's 0.25–4.0. `response_format` defaults to `mp3`, as OpenAI's does; `mp3`, `opus` (Ogg), `flac`, `wav` and `pcm` (raw 16-bit at `X-Sample-Rate`, 24 kHz) are encoded by libsndfile, and `aac` is refused since the image has no FFmpeg. The answer is the whole clip with `/api/tts`'s `X-*` headers, not a stream (`stream_format` must be `audio`); errors use OpenAI's `{"error": {"message", "type"}}` shape. `GET /v1/audio/models` lists the model.
+- `POST /v1/audio/speech` takes `input`, `voice`, `response_format`, `speed` and `stream_format`, plus this app's own fields: `seed`, `language`, `volume` (LUFS) and the sampling options `/v1/health` lists. `model` and `instructions` are ignored. `voice` must be one of this app's voices (`/v1/audio/voices`, `{"voices": [{"id", "name"}]}` as other OpenAI-style TTS servers list them), not OpenAI's names, and `speed` is 0.5–2.0 rather than OpenAI's 0.25–4.0.
+- `response_format` defaults to `mp3`, as OpenAI's does. `mp3`, `opus` (Ogg), `flac`, `wav` and `pcm` (raw 16-bit at `X-Sample-Rate`, 24 kHz) are encoded by libsndfile, and `aac` is refused since the image has no FFmpeg.
+- Without `stream_format`, the answer is the whole clip with timing headers: `X-Synthesis-Seconds`, `X-Audio-Seconds`, `X-RTF`, `X-Token-Limited`, `X-Peak-CUDA-GB`, `X-Loudness-LUFS`, `X-Loudness-Limited`, `X-Sample-Rate`. A text too long for `max_tokens` is a 413. `stream_format` `audio` or `sse` streams it instead (see [Streaming](#streaming)).
+- `/v1/health` reports the model, the CUDA device, the languages, and the ranges of `speed`, `volume` and the sampling options. It and the page title show the image tag from the `VERSION` file the build writes beside the app directories, as in [Voice chat](#voice-chat).
+- The page uses relative URLs. Behind a path prefix, open it with a trailing slash (`/tts/`). It retries a 503.
+- [txt2mp3 and txt2m4b](#txt2mp3-and-txt2m4b) narrate text files through it.
 - Neither TTS nor STT authenticates: both serve plain HTTP (and STT's WebSocket) and ignore `Authorization`. The deployment provides login and API tokens in front of them (in the homelab, OAuth2 Proxy for the page and a bearer check at the Gateway for the APIs).
 - Every app logs the caller of a request that carries `X-Consumer` (the Gateway's bearer check) or an email from OAuth2 Proxy (`X-Auth-Request-Email` as a Gateway auth check, else `X-Forwarded-Email` as a reverse proxy, as in front of the TTS page): one `ray.serve` line with the method, path, status (or `accepted`/`refused` for a WebSocket, `failed` for an exception), seconds, and those values. Requests without them appear only in Serve's access log. `Authorization` is never read or logged. The headers are trusted as they arrive, so the proxy in front must set or strip them. Voice chat and meeting notes don't forward the browser user to STT and TTS: their calls are logged under the identity their own token gets (in the homelab, `consumer=ray-vchat`), and the user under chat's or meeting's own line.
 
@@ -107,7 +107,7 @@ TTS and STT run in the voice image's system Python. Its torch and torchaudio are
 
 | Setting | Default | Effect |
 |---|---|---|
-| `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model ID reported by `/health`; loaded from the Hub if `TTS_MODEL_DIR` is unset |
+| `TTS_MODEL` | `Qwen/Qwen3-TTS-12Hz-1.7B-Base` | Model ID reported by `/v1/health` and `/v1/models`; loaded from the Hub if `TTS_MODEL_DIR` is unset |
 | `TTS_MODEL_DIR` | unset | Local copy of the model (with `HF_HUB_OFFLINE=1`) |
 | `TTS_VOICES_DIR` | `/home/ray/serve/tts/voices` | WAV + `.txt` transcript pairs; encoded at startup, re-encoded on the next request after either file changes |
 | `TTS_NUM_REPLICAS` | `2` | Replicas, one GPU each |
@@ -122,7 +122,7 @@ Set these in the application's `runtime_env` `env_vars`. They are read where Ser
 
 Each replica asks for `num_gpus: 1` plus a custom `tts: 1` resource and handles one request at a time. Serve queues further requests and routes each to an idle replica, replacing the MLX service's lock and its 409.
 
-- `/health`, `/voices`, and `/` are requests too, so they wait in the same queue while every replica is synthesizing.
+- `/v1/health`, `/v1/audio/voices`, `/v1/models` and `/` are requests too, so they wait in the same queue while every replica is synthesizing.
 - The model loads in bf16 on `cuda:0`. Startup fails unless it is a Base model whose speech tokenizer has an encoder.
 - At startup, each voice's reference is encoded once into a voice-clone prompt (speech-tokenizer codes plus speaker embedding), logged as `Encoded N voice prompts in X s`. Requests reuse it instead of re-encoding the WAV. A voice that fails to encode is logged and skipped; it returns the same error per request as before.
 - There is no client-IP allowlist; access control belongs to the Gateway.
@@ -158,11 +158,19 @@ Two hooks wrap the talker's `generate` (the first codebook) at load time. `Qwen3
 
 ### Streaming
 
-A request with `"stream": true` gets `application/x-ndjson`: an `audio` line (`sample_rate`, base64 16-bit mono `pcm`) about every second of speech as it is generated, then `done` (timings, `first_audio_seconds`, `rtf`, `token_limited`, `peak_cuda_gb`, `gain_db`, `clipped_samples`) or `error`. This is the MLX service's format, which site-up's voice chat plays piece by piece. `speed` is rejected with streaming.
+A request with `stream_format` gets its audio about every second of speech as it is generated, instead of after the whole clip. Voice chat asks for `pcm` over SSE and plays it piece by piece.
+
+- `audio` streams the encoded bytes themselves (chunked, with `X-Sample-Rate`). `sse` sends `text/event-stream` events: a `speech.audio.delta` (base64 `audio`) per piece, then `speech.audio.done` with OpenAI's `usage` (text tokens in, codec frames out) plus this app's timings (`synthesis_seconds`, `first_audio_seconds`, `audio_seconds`, `rtf`, `token_limited`, `peak_cuda_gb`, `gain_db`, `clipped_samples`), or an `error` event.
+- The reply starts with the first piece, so a failure before it is still an error status. Later, SSE sends an `error` event and raw audio ends unfinished.
+- A stream can be `mp3`, `opus`, `wav` or `pcm`, not `flac`, whose header libsndfile fills in only on close, after a stream has sent it. A streamed WAV's header gives the maximum length, as for a WAV still being written. A streamed MP3 is constant bitrate (about 80 kb/s), since it can't get the Xing header that tells readers a variable-bitrate file's length. `speed` is rejected with streaming.
 
 - A third hook wraps the talker's `forward` and hands each completed codec frame (the first code plus the code predictor's 15) to the request's `Streamer`. After the last frame the talker hook raises `StreamFinished`, so `generate_voice_clone`'s full-clip decode is skipped.
 - Every 12 frames, `decode_tail` decodes the new frames with the voice's reference codes and the speech so far in front, up to `TTS_STREAM_CONTEXT_FRAMES`, the way the full-clip decode puts the reference first. Only the decoder transformer sees that whole window. The vocoder after it is causal with a receptive field of 5–8 frames, so it re-runs just 8 frames in front of the new ones. A CPU check with a random-weight decoder matched the full-clip decode to float rounding (about 350 dB SNR) whenever reference plus speech fits in 300 frames. Past that, qwen-tts's own decode drops to 25 frames of left context while streaming keeps 300.
 - The clip's loudness is unknown until it ends, so the gain comes from the reference recording, whose level the clone follows, and samples past the peak ceiling are clipped (`clipped_samples`).
+
+### txt2mp3 and txt2m4b
+
+`scripts/txt2mp3.py` narrates a text file into one MP3, and `scripts/txt2m4b.py` a book into a chaptered m4b; their `--help` describes them. Each non-empty line is a paragraph, synthesized with `POST /v1/audio/speech` as a WAV, so they need Python 3.11+ and FFmpeg but nothing from this repository's environment. `scripts/tts_client.py`, which both use, spreads paragraphs over every endpoint in `~/.config/mlx-tts/endpoints.toml` (or `--endpoints`), or sends them to one `--tts-url`, with a bearer token for each; an endpoint URL is the app's base, with or without `/v1`. They came from site-up's `ai/mlx-tts-svc`, and the MLX service itself can no longer be an endpoint, since it only speaks `/api/tts`.
 
 ## STT
 
@@ -211,7 +219,7 @@ Mount it at its own route prefix, for example `route_prefix: /chat`, and open th
 | `CHAT_LLM_URL` | `http://localhost:8080/v1` | OpenAI-compatible base URL for streamed `/chat/completions` |
 | `CHAT_LLM_MODEL` | `qwen3.5-9b-q8-uncensored` | Model ID sent with each LLM request |
 | `CHAT_LLM_MAX_TOKENS` | `512` | Cap on each reply |
-| `CHAT_TTS_URL` | `http://localhost:5004` | Base URL of a TTS with this image's TTS API (`/health`, `/voices`, `/api/tts`) |
+| `CHAT_TTS_URL` | `http://localhost:5004/v1` | This image's TTS, including its `/v1` (`/health`, `/audio/voices`, `/audio/speech` as `pcm` over SSE) |
 | `CHAT_VOICE` | unset | Voice for turns that name none; the page defaults to it, else to TTS's first voice |
 | `CHAT_SYSTEM_PROMPT` | short, spoken, same-language replies | Replaces the built-in system prompt |
 | `CHAT_STT_TOKEN`, `CHAT_LLM_TOKEN`, `CHAT_TTS_TOKEN` | unset | Sent as `Authorization: Bearer <token>` to that backend |

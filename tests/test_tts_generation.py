@@ -1,10 +1,4 @@
-"""serve_tts's hooks into qwen-tts internals, against tiny random models of the installed qwen-tts on CPU.
-
-These are the checks AGENTS.md asks to rerun when upgrading qwen-tts or transformers: the talker hooks, and
-decode_tail / Streamer matching the full-clip decode.
-"""
-
-import base64
+"""serve_tts's hooks into qwen-tts internals on tiny models; rerun when upgrading qwen-tts or transformers."""
 
 import numpy as np
 import pytest
@@ -153,7 +147,7 @@ def streamed(tiny_decoder, ref, generated, context, gain_db):
     for frame in generated:
         streamer.frame(frame)
     streamer.flush()
-    pcm = np.frombuffer(b"".join(base64.b64decode(e["pcm"]) for e in events), dtype="<i2")
+    pcm = np.frombuffer(b"".join(e["pcm"] for e in events), dtype="<i2")
     return streamer, events, pcm
 
 
@@ -165,9 +159,7 @@ def test_stream_matches_full_clip_decode(tiny_decoder):
     gain_db = 6.0
     streamer, events, pcm = streamed(tiny_decoder, ref, generated, 300, gain_db)
 
-    assert [len(base64.b64decode(e["pcm"])) // 2 for e in events] == [
-        n * int(tiny_decoder.total_upsample) for n in (12, 12, 12, 4)
-    ]
+    assert [len(e["pcm"]) // 2 for e in events] == [n * int(tiny_decoder.total_upsample) for n in (12, 12, 12, 4)]
     with torch.inference_mode():
         full = tiny_decoder(torch.cat([ref, generated]).T[None])[0, 0].numpy()
     expected = full[ref.shape[0] * int(tiny_decoder.total_upsample) :] * 10 ** (gain_db / 20)

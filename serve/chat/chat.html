@@ -45,9 +45,8 @@ const $ = id => document.getElementById(id);
 const TARGET_RATE = 16000;
 let ctx, mic, recorder, frames = [], recording = false;
 let history = [], controller = null, sources = [], nextTime = 0, turn = null;
-// Hands-free voice activity detection, all durations in seconds. Speech starts when the level stays
-// above a multiple of the adaptive noise floor for `onset`; while the bot is speaking the bar is
-// higher and longer so leftover echo does not interrupt it. It ends after `hangover` of quiet.
+// Hands-free VAD, in seconds: speech is `onset` above a multiple of the noise floor (higher while the bot speaks,
+// so echo doesn't interrupt) and ends after `hangover` of quiet.
 const VAD = {preroll: 0.3, onset: 0.15, onsetPlaying: 0.35, ratio: 3, ratioPlaying: 6, keepRatio: 2,
   minLevel: 0.01, hangover: 0.8, minSpeech: 0.3, maxUtterance: 30, floorUp: 3, floorDown: 0.3};
 let handsFree = false, wakeLock = null;
@@ -204,8 +203,7 @@ function finishTurn(interrupted) {
   turn = null;
 }
 
-// A streamed piece is raw 16-bit PCM, built into a buffer at its own rate: decoding each piece as a separate WAV
-// would resample it alone and could click at the joins. A whole-chunk WAV from a non-streaming backend is decoded.
+// Raw PCM, not a WAV per piece: decoding pieces separately resamples each and clicks at the joins.
 function pcmBuffer(event) {
   const samples = new Int16Array(base64Bytes(event.pcm));
   const audio = ctx.createBuffer(1, samples.length, event.sample_rate), channel = audio.getChannelData(0);
@@ -213,9 +211,8 @@ function pcmBuffer(event) {
   return audio;
 }
 
-async function play(event, owner) {
-  const audio = event.pcm ? pcmBuffer(event) : await ctx.decodeAudioData(base64Bytes(event.wav));
-  if (owner.cancelled) return;  // interrupted while decoding
+function play(event) {
+  const audio = pcmBuffer(event);
   const source = ctx.createBufferSource();
   source.buffer = audio;
   source.connect(ctx.destination);
@@ -259,8 +256,8 @@ async function send(payload, userText) {
           current.reply += event.delta;
           current.bot.text.textContent = current.reply;
         } else if (event.type === 'audio') {
-          playing = playing.then(() => current.cancelled || play(event, current)).catch(err => status(`Playback error: ${err.message}`));
-          status(`Speaking · chunk ${event.index + 1}` + (event.rtf ? ` RTF ${event.rtf}` : ''));
+          playing = playing.then(() => current.cancelled || play(event)).catch(err => status(`Playback error: ${err.message}`));
+          status(`Speaking · chunk ${event.index + 1}`);
         } else if (event.type === 'error') {
           const div = document.createElement('div');
           div.className = 'error';
