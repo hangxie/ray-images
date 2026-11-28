@@ -1,9 +1,4 @@
-"""Ray Serve voice-cloning service using Qwen3-TTS Base (qwen-tts / PyTorch on CUDA).
-
-OpenAI's speech API (`POST /v1/audio/speech`, whole clips or streamed as raw audio or SSE) plus `GET /v1/health`,
-`/v1/audio/voices`, `/v1/models` and the test page at `/`. Serve builds the application on the head, which only needs
-the routes, and pickles it; torch, transformers and qwen_tts load inside the replica.
-"""
+"""Ray Serve voice cloning with Qwen3-TTS Base behind OpenAI's speech API, plus a test page at `/`."""
 
 import asyncio
 import base64
@@ -32,9 +27,7 @@ from caller_log import CallerLog
 ROOT = Path(__file__).resolve().parent
 VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
 VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
-# Sampling options exposed for Base cloning (ICL): name -> (type, fallback default, min, max). Defaults come from the
-# model's generation_config.json when it sets them. A None default means the option is derived per request when omitted.
-# Unlike mlx-audio, qwen-tts passes repetition_penalty through unchanged in ICL mode, so there is no 1.5 floor.
+# name -> (type, default, min, max); generation_config.json overrides defaults, None is derived per request
 SAMPLING = {
     "temperature": (float, 0.9, 0.0, 1.5),
     "top_k": (int, 50, 0, 1024),
@@ -42,27 +35,22 @@ SAMPLING = {
     "repetition_penalty": (float, 1.05, 1.0, 3.0),
     "max_tokens": (int, None, 1, 4096),
 }
-# Normal speech takes 3.6-4.4 codec tokens per text token. Text needing more than max_tokens at the typical rate is
-# rejected rather than cut off. Without an explicit max_tokens, generation stops at twice that rate so a runaway is
-# bounded by the text length; text that expands when spoken, such as acronyms, can need an explicit max_tokens.
+# Speech takes ~4 codec tokens per text token; text needing more than max_tokens is a 413. Without max_tokens,
+# generation stops at the budget, so a runaway is bounded by the text length.
 SPEECH_TOKENS_PER_TEXT_TOKEN = 4
 SPEECH_TOKEN_BUDGET_PER_TEXT_TOKEN = 8
 MIN_SPEECH_TOKEN_BUDGET = 75
-# Playback speed factor applied after synthesis: default, min, max. Done here as a pitch-preserving time-stretch
-# rather than a model option, matching the MLX service.
+# speed (a time-stretch after synthesis): default, min, max
 SPEED_DEFAULT, SPEED_MIN, SPEED_MAX = 1.0, 0.5, 2.0
-# Output loudness in LUFS (ITU-R BS.1770 integrated): default, min, max. Each request is normalized to this target
-# so every voice comes out at one volume; a louder target is capped so the waveform never clips.
+# target loudness in LUFS (BS.1770): default, min, max; capped so peaks never clip
 VOLUME_DEFAULT, VOLUME_MIN, VOLUME_MAX = -20.0, -40.0, -9.0
 PEAK_CEILING = 10 ** (-1.0 / 20)  # leave 1 dB of headroom below full scale when gaining up
-# A streamed request sends audio every this many codec frames (12.5 Hz, so about a second) as they are generated.
+# codec frames per streamed piece (12.5 Hz, about a second)
 STREAM_FRAMES = 12
-# Frames the vocoder re-runs in front of each streamed piece. It is causal with a receptive field of 5-8 frames, so
-# with this margin a piece matches the full-clip decode; the decoder transformer before it gets the longer context.
+# frames the vocoder re-runs before each piece; covers its 5-8 frame receptive field
 STREAM_VOCODER_MARGIN = 8
 
-# OpenAI's response_format values: libsndfile container, subtype and media type. No FFmpeg, so no `aac`; `pcm` is raw
-# little-endian 16-bit at the model's rate (X-Sample-Rate), as OpenAI's is at 24 kHz.
+# response_format -> libsndfile container, subtype, media type; no `aac` (no FFmpeg); `pcm` is raw 16-bit LE
 OPENAI_FORMATS = {
     "mp3": ("MP3", "MPEG_LAYER_III", "audio/mpeg"),
     "opus": ("OGG", "OPUS", "audio/ogg"),
@@ -70,11 +58,9 @@ OPENAI_FORMATS = {
     "wav": ("WAV", "PCM_16", "audio/wav"),
     "pcm": (None, None, "audio/pcm"),
 }
-# Formats a streamed response (stream_format audio or sse) can use: it starts before the clip's length is known, and
-# libsndfile fills in a FLAC header only on close, after a stream has sent it.
+# no flac: libsndfile writes its header on close
 STREAM_FORMATS = ("mp3", "opus", "wav", "pcm")
-# A streamed MP3 is constant bitrate (about 80 kb/s at 24 kHz): it has no Xing header, which libsndfile writes on close,
-# and readers estimate a VBR stream's length from its first frame.
+# CBR (~80 kb/s): a stream has no Xing header, so readers misjudge a VBR one's length
 STREAM_MP3_COMPRESSION = 0.5
 
 logger = logging.getLogger("ray.serve")
@@ -120,15 +106,13 @@ def encode(audio, sample_rate, response_format):
 
 
 def wav_header(sample_rate):
-    """A 16-bit mono WAV header for a stream of unknown length: RIFF and data sizes at their maximum, as readers
-    expect from a WAV that is still being written."""
+    """A 16-bit mono WAV header for a stream of unknown length (sizes at their maximum)."""
     fmt = struct.pack("<HHIIHH", 1, 1, sample_rate, 2 * sample_rate, 2, 16)
     return b"RIFF" + struct.pack("<I", 0xFFFFFFFF) + b"WAVEfmt " + struct.pack("<I", 16) + fmt + b"data\xff\xff\xff\xff"
 
 
 class StreamEncoder:
-    """Encodes a streamed clip as it is generated: `feed` takes 16-bit PCM and returns the bytes ready to send, `close`
-    the rest. libsndfile writes into a buffer and each call sends what it has appended since."""
+    """Incremental encoder: `feed(pcm)` and `close()` return the newly encoded bytes."""
 
     def __init__(self, response_format, sample_rate):
         self.file, self.head = None, b""
@@ -171,11 +155,7 @@ def reply(status, body, media_type="application/json", headers=None):
 
 
 def settings():
-    """Replica settings, read where Serve builds the app (the head), which has the application's env_vars.
-
-    They reach the replica as TTS.bind() arguments, so the values the head read are the ones replicas use; module-level
-    globals would be re-read in each replica process instead.
-    """
+    """Replica settings, read on the head (which has the app's env_vars) and passed through bind()."""
     return {
         "model": os.environ.get("TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
         "model_dir": os.environ.get("TTS_MODEL_DIR"),  # local copy of the model; the Hub ID is used when unset
@@ -192,13 +172,9 @@ def voices(directory):
 
 
 def time_stretch(samples, speed, sample_rate, frame_seconds=0.04, tolerance_seconds=0.015):
-    """Scale duration by 1/speed while preserving pitch, via WSOLA.
+    """Scale duration by 1/speed while preserving pitch, via WSOLA (a phase vocoder sounded hoarse).
 
-    Output is built from Hann-windowed input frames overlapped at 50%. Each frame is read near its
-    nominal position, shifted by up to the tolerance (about one pitch period at 70 Hz) to the offset
-    whose waveform best matches the natural continuation of the previous frame, so glottal pulses
-    line up across the overlap. Unlike a phase vocoder, no phase is resynthesized, which is what made
-    slowed-down speech sound hoarse.
+    50%-overlapped Hann frames, each shifted up to one 70 Hz pitch period to best continue the previous one.
     """
     if speed == SPEED_DEFAULT or samples.size == 0:
         return samples
@@ -290,9 +266,8 @@ class Job:
 def decode_tail(decoder, codes, new, margin):
     """Waveform of the last `new` frames of `codes` (frames x codebooks), as the speech tokenizer decodes them.
 
-    The same steps as Qwen3TTSTokenizerV2Decoder.forward, except that the vocoder (upsampling and convolutions) runs
-    only on the last `new + margin` frames: it dominates the cost and is causal with a short receptive field, while the
-    decoder transformer before it attends over the whole window. Recheck this when upgrading qwen-tts.
+    Qwen3TTSTokenizerV2Decoder.forward, with the costly causal vocoder on the last `new + margin` frames only.
+    Recheck when upgrading qwen-tts.
     """
     hidden = decoder.quantizer.decode(codes.T[None].clamp(min=0))
     hidden = decoder.pre_conv(hidden).transpose(1, 2)
@@ -309,10 +284,8 @@ def decode_tail(decoder, codes, new, margin):
 class Streamer:
     """Decodes a streamed synthesis every STREAM_FRAMES codec frames and hands each piece of PCM to `emit`.
 
-    Each piece is decoded with the voice's reference codes and the speech so far in front, capped at `context` frames,
-    as the full-clip decode puts the reference in front so the vocoder hears the voice first. The clip's loudness is
-    unknown until it ends, so the gain comes from the reference recording, whose level the clone follows; anything
-    past the peak ceiling is clipped.
+    Each piece is decoded after the reference and earlier speech (up to `context` frames). The clip's loudness is
+    unknown until the end, so gain comes from the reference recording; peaks past the ceiling clip.
     """
 
     def __init__(self, decoder, ref_code, sample_rate, context, gain_db, emit):
@@ -355,10 +328,8 @@ class Streamer:
 def hook_talker(model, current, prepare=None):
     """Add the end-of-speech and disconnect hooks to the talker's first-codebook generate.
 
-    Qwen3TTSForConditionalGeneration.generate builds the talker's kwargs itself and drops unknown ones, so the hooks
-    cannot pass through generate_voice_clone. The code predictor's own generate, which fills the other codebooks and
-    has no end-of-speech, gets no hooks. `current()` returns the running Job; `prepare`, if given, adjusts the talker's
-    generate kwargs (cuda_graphs.install). Recheck this when upgrading qwen-tts.
+    generate_voice_clone drops unknown kwargs, so the hooks can't pass through it. `current()` returns the running Job;
+    `prepare` adjusts the talker's generate kwargs (cuda_graphs.install). Recheck when upgrading qwen-tts.
     """
     import torch
     from transformers import LogitsProcessor, LogitsProcessorList, StoppingCriteria, StoppingCriteriaList
@@ -368,10 +339,7 @@ def hook_talker(model, current, prepare=None):
     class TakeLikelyEos(LogitsProcessor):
         """Stop whenever end-of-speech is the most likely token instead of leaving it to sampling.
 
-        End-of-speech is only likely for a step or two after the last syllable, at roughly 35-55%. A missed draw
-        never recovers and runs to max_tokens, so the stop is taken greedily while all other tokens stay sampled.
-        Custom processors run after repetition penalty and token suppression and before the sampling warpers, so
-        the argmax here is that of the processed scores.
+        It peaks at 35-55% for a step or two, and a missed draw runs to max_tokens.
         """
 
         def __call__(self, input_ids, scores):
@@ -427,8 +395,7 @@ def hook_talker(model, current, prepare=None):
 @serve.deployment(
     ray_actor_options={"num_gpus": 1, "resources": {"tts": 1}},
     num_replicas=int(os.environ.get("TTS_NUM_REPLICAS", "2")),
-    # One synthesis per replica: Serve queues the rest and routes each to an idle replica. A backlog beyond
-    # max_queued_requests fails fast with 503 instead of growing without bound.
+    # one synthesis per replica; past max_queued_requests, 503
     max_ongoing_requests=1,
     max_queued_requests=int(os.environ.get("TTS_MAX_QUEUED_REQUESTS", "4")),
 )
@@ -470,8 +437,7 @@ class TTS:
                 settings["kv_cache_tokens"],
                 torch.cuda.memory_allocated() / 1e9,
             )
-        # Reference prompts (speech-tokenizer codes + speaker embedding) per voice, encoded once here instead of on
-        # every request. Keyed by the pair's mtimes, so a replaced WAV or transcript is re-encoded on next use.
+        # voice prompts, encoded once; keyed by the files' mtimes so a replaced voice is re-encoded
         self.prompts: dict[str, tuple[tuple[int, int], Any, Any]] = {}
         started = time.perf_counter()
         for voice in voices(self.voices_dir):
@@ -541,7 +507,7 @@ class TTS:
 
     @api.get("/v1/audio/voices")
     def list_voices(self):
-        """The voices as OpenAI-style TTS servers list them, for clients such as Open WebUI that ask."""
+        """Voices in the OpenAI-style TTS server shape, for clients such as Open WebUI."""
         return reply(200, {"voices": [{"id": name, "name": name} for name in voices(self.voices_dir)]})
 
     @api.get("/v1/models")
@@ -550,11 +516,9 @@ class TTS:
 
     @api.post("/v1/audio/speech")
     async def speech(self, request: Request):
-        """OpenAI's speech API: `input`, `voice`, `response_format`, `speed` and `stream_format`, plus this service's
-        own fields (`seed`, `language`, `volume`, sampling). `model` and `instructions` are ignored.
+        """OpenAI's speech API, plus `seed`, `language`, `volume` and sampling; `model` and `instructions` are ignored.
 
-        Without `stream_format` the answer is the whole clip with `X-*` timing headers. `audio` streams the clip's bytes
-        as they are generated, and `sse` sends them as `speech.audio.delta` events followed by `speech.audio.done`.
+        Without `stream_format`: the whole clip with `X-*` headers. `audio` streams bytes, `sse` OpenAI's events.
         """
         try:
             req = await request_json(request)
@@ -595,8 +559,7 @@ class TTS:
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
-            # Serve cancels the request when the HTTP client disconnects. Wait for generation to stop at the next codec
-            # frame so this replica is idle before Serve routes it the next queued request.
+            # Serve cancels on disconnect: wait for generation to stop so the replica is free for the next request.
             job.stop.set()
             logger.info("POST /v1/audio/speech abandoned: client disconnected")
             with contextlib.suppress(Exception):
@@ -607,9 +570,10 @@ class TTS:
             raise
 
     def options(self, req, stream=False):
-        """Validate a speech request's fields; returns generate()'s arguments plus `text_tokens`. Raises ValueError
-        (TextTooLong when the text can't fit in max_tokens) or the TypeError, KeyError or AttributeError of a
-        malformed field."""
+        """Validate a speech request; returns generate()'s arguments plus `text_tokens`.
+
+        Raises ValueError (TextTooLong past max_tokens), or TypeError, KeyError or AttributeError for a bad field.
+        """
         text, voice = req["input"], req["voice"]
         seed = int(req.get("seed", 0))
         speed = float(req.get("speed", SPEED_DEFAULT))
@@ -653,10 +617,9 @@ class TTS:
         }
 
     async def stream_speech(self, options, response_format, stream_format):
-        """Reply as speech is generated: the encoded bytes (`audio`) or SSE events (`sse`).
+        """Reply as speech is generated: encoded bytes (`audio`) or SSE events (`sse`).
 
-        The reply starts with the first piece of audio, so a failure before it, such as an unreadable voice, is still
-        an error status. A failure after it is an SSE `error` event, or for raw audio a connection cut short.
+        It starts at the first piece, so earlier failures are an error status; later ones an SSE `error` or a cut.
         """
         loop = asyncio.get_running_loop()
         events: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -671,8 +634,7 @@ class TTS:
 
         async def finish(abandoned):
             if abandoned:
-                # The client disconnected: stop at the next codec frame so this replica is idle before Serve routes it
-                # the next queued request.
+                # client left: stop so the replica is free for the next request
                 job.stop.set()
                 logger.info("POST /v1/audio/speech stream abandoned: client disconnected")
             with contextlib.suppress(Exception):
@@ -719,8 +681,7 @@ class TTS:
                         break
                     event = await events.get()
             finally:
-                # Not `task.done()`: the thread emits `done` just before it returns, so a finished stream usually still
-                # sees the task running here.
+                # not `task.done()`: the thread emits `done` just before it returns
                 await finish(abandoned=not finished)
                 with contextlib.suppress(Exception):
                     encoder.close()
@@ -837,5 +798,5 @@ class TTS:
         )
 
 
-# mypy ignores class decorators (python/mypy#3135), so it sees TTS as the plain class rather than a Deployment
+# mypy ignores class decorators (python/mypy#3135)
 app = cast(serve.Deployment, TTS).bind(settings())

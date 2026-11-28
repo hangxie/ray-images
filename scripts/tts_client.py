@@ -43,8 +43,7 @@ PROBE_TIMEOUT = 10
 BUSY_SECONDS = 5
 # Backoff for an endpoint that stopped answering, doubling from the first to the last value.
 BACKOFF = (5, 300)
-# The run fails once every endpoint has been failing this long, or once one paragraph has failed this many times and
-# on every endpoint still in the run, so one broken endpoint cannot fail a paragraph that the others can synthesize.
+# The run fails once every endpoint has failed this long, or a paragraph this many times on every endpoint left.
 STALL_SECONDS = 900
 MAX_ATTEMPTS = 4
 
@@ -154,7 +153,7 @@ def load_endpoints(args, error):
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
-    # A missing token makes the homelab gateway redirect to its SSO login; following it would return a 200 page.
+    # no redirects: without a token the gateway redirects to an SSO page that answers 200
     def redirect_request(self, *args):
         return None
 
@@ -260,13 +259,13 @@ class Pool:
                 if now < e.retry_at:
                     self.cond.wait(e.retry_at - now)
                 elif e.failing_since is not None:
-                    # Recheck without holding a paragraph, which other endpoints can take meanwhile.
+                    # recheck without holding a paragraph
                     e.retry_at = now + PROBE_TIMEOUT
                     return PROBE
                 elif job := self.next_job(e, live):
                     return job
                 else:
-                    # Idle until a job is requeued or the last one finishes.
+                    # idle until a job is requeued or the last one finishes
                     self.cond.wait(BUSY_SECONDS)
 
     def next_job(self, e, live):
@@ -321,8 +320,7 @@ class Pool:
             if exc.code == 404:
                 return self.drop(e, job, "HTTP 404; check its url")
             if exc.code in (429, 503):
-                # Busy: a full Ray Serve queue, such as while voice chat or the page is using every replica. Hand the
-                # paragraph to another endpoint and look again shortly; being busy is not a failure.
+                # busy (Serve queue full): requeue and retry soon; not a failure
                 with self.cond:
                     if not e.busy:
                         print(f"[{e.name}] busy (HTTP {exc.code}); retrying every {BUSY_SECONDS} s", flush=True)
@@ -330,7 +328,7 @@ class Pool:
                     e.retry_at = time.monotonic() + BUSY_SECONDS
                 return self.requeue(job)
             if 400 <= exc.code < 500:
-                # Bad text or settings fail the same way on every endpoint.
+                # bad text or settings fail on every endpoint
                 return self.stop(f"{job.label} failed on {e.name} (HTTP {exc.code}): {http_error(exc)}")
             return self.retry(e, job, f"HTTP {exc.code}: {http_error(exc)}")
         except (urllib.error.URLError, OSError, http.client.HTTPException) as exc:

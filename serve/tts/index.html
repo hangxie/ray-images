@@ -60,9 +60,8 @@ async function initialize() {
   if (voices.includes('hang-en')) $('voice').value = 'hang-en';
   if (!voices.length) { $('submit').disabled = true; $('message').textContent = 'No reference WAVs with matching transcripts are available.'; }
 }
-// Android Chrome drops an in-flight request when the page goes to the background, and may leave it unsettled until the
-// page returns. A request that was in flight while hidden is resent on return, and a dropped or busy (503) one is retried
-// until Stop; the service abandons a synthesis whose client has gone, so the retry is not left waiting on it.
+// Android Chrome drops requests in the background: resend one that was in flight while hidden, and retry a dropped
+// or busy (503) one until Stop.
 async function synthesize(current, body, info) {
   for (let retry = false; ; retry = true) {
     if (retry) { info.textContent = 'Connection lost; retrying…'; await new Promise(resolve => setTimeout(resolve, 1000)); }

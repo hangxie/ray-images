@@ -1,10 +1,7 @@
-"""Ray Serve speech-to-text service: Whisper (transformers / PyTorch on CUDA) behind OpenAI's transcription API.
+"""Ray Serve speech-to-text: Whisper (transformers on CUDA) behind OpenAI's transcription API.
 
-Port of site-up's ai/mlx-stt-svc with the same HTTP surface under /v1, plus a plain recording page at `GET /` (stt.html)
-and a WebSocket at `/v1/audio/stream` that transcribes a live recording as it goes, for serve_meeting's page. The routes
-carry /v1 themselves, so the app mounts at `/` (or any prefix) with the page at its root. It shares the voice image
-with serve_tts, whose transformers (4.57.3, with Whisper), soundfile and scipy already cover transcription; the stream
-adds only silero-vad. As in serve_tts, torch and transformers load inside the replica.
+Routes carry `/v1` themselves, so the app mounts at `/` with its recording page (stt.html) there. `/v1/audio/stream`
+is a live-transcription WebSocket for serve_meeting.
 """
 
 import asyncio
@@ -62,7 +59,7 @@ def error(status, message):
 
 
 def settings():
-    """Replica settings, read on the head and passed through bind(), as in serve_tts."""
+    """Replica settings, read on the head and passed through bind()."""
     return {
         "model": os.environ.get("STT_MODEL", "openai/whisper-large-v3-turbo"),
         "model_dir": os.environ.get("STT_MODEL_DIR"),  # local copy of the model; the Hub ID is used when unset
@@ -100,14 +97,10 @@ def load_audio(data):
 class Segmenter:
     """Cuts a live 16 kHz stream into pieces for Whisper at short pauses, so text keeps up with long speech.
 
-    `probability` scores each 32 ms frame as speech, 0 to 1: Silero VAD in the replica (STT.detector), which tells
-    speech from music and noise where loudness can't. A frame is speech from SPEECH and quiet below QUIET (Silero's
-    own hysteresis); speech runs shorter than `min_run_seconds` don't count, as in Silero's own segmenting, since a
-    beat or a clatter can score as speech for a frame or two. Past `min_seconds` the next `pause_seconds` of quiet
-    ends a piece; at `max_seconds` it ends after the frame least like speech past `min_seconds`. A piece is trimmed
-    to its speech plus `margin_seconds`, and one with less than `min_speech_seconds` of speech is dropped (Whisper
-    makes up text from silence and music). A piece starts a paragraph after `paragraph_seconds` without speech. Times
-    are seconds from the start of the stream.
+    `probability` scores each 32 ms frame (Silero VAD): speech from SPEECH, quiet below QUIET, and runs under
+    `min_run_seconds` ignored. After `min_seconds`, `pause_seconds` of quiet ends a piece; at `max_seconds` it ends
+    at the least speech-like frame. Pieces are trimmed to speech plus `margin_seconds` and dropped under
+    `min_speech_seconds` (Whisper invents text from silence). `paragraph_seconds` without speech starts a paragraph.
     """
 
     FRAME = 512  # the frame Silero VAD takes at 16 kHz
@@ -219,9 +212,7 @@ def control(message):
 @serve.deployment(
     ray_actor_options={"num_gpus": 1},
     num_replicas=int(os.environ.get("STT_NUM_REPLICAS", "1")),
-    # A live stream holds its request for as long as it lasts, so several run at once and self.gpu takes
-    # transcriptions one at a time. Utterances take well under a second, so requests wait instead of failing; past
-    # the queue they get 503.
+    # Live streams hold their requests, so several run at once; self.gpu serializes transcriptions.
     max_ongoing_requests=int(os.environ.get("STT_MAX_ONGOING_REQUESTS", "16")),
     max_queued_requests=int(os.environ.get("STT_MAX_QUEUED_REQUESTS", "8")),
 )
@@ -303,14 +294,10 @@ class STT:
     async def stream(self, websocket: WebSocket):
         """Live transcription of one long recording.
 
-        The client sends 16 kHz mono 16-bit little-endian PCM as binary messages, then `{"type": "stop"}`. The server
-        cuts it with a Segmenter and sends, in order, a `segment` event (start, end, text, language, paragraph,
-        seconds) for each piece with text, an `error` event for a piece that failed, and `done` after the last one.
-        Each piece gets the text before it as its prompt, and keeps the language of the first piece with text.
-
-        While a piece is still going, about every PARTIAL_SECONDS of audio a `partial` event (start, text) previews
-        its text so far, when the GPU is free and no finished piece is waiting; the piece's `segment`, with the same
-        start, replaces it, and no partial for a piece comes after its segment.
+        In: 16 kHz mono 16-bit LE PCM as binary messages, then `{"type": "stop"}`. Out: a `segment` (start, end,
+        text, language, paragraph, seconds) per piece with text, `error` for a failed piece, then `done`. Each piece
+        is prompted with the text before it and keeps the first piece's language. A `partial` (start, text) previews
+        the running piece about every PARTIAL_SECONDS when the GPU is free; its `segment` replaces it.
         """
         await websocket.accept()
         try:
@@ -398,8 +385,7 @@ class STT:
             )
 
     def detector(self):
-        """A speech probability for each 32 ms frame: a Silero VAD model of the stream's own, since it keeps state
-        between frames. Loading one takes ~20 ms and a frame ~0.3 ms on one CPU thread; no GPU."""
+        """Per-stream Silero VAD (it keeps state): a speech probability per 32 ms frame, on CPU."""
         import torch
         from silero_vad import load_silero_vad
 
@@ -430,8 +416,7 @@ class STT:
                 raise
 
     def transcribe(self, audio, language, prompt=""):
-        """Transcript and language code; the language is detected from the first 30 s when not given. `prompt` is
-        what was said before this audio, which keeps words split across pieces and spellings consistent."""
+        """Transcript and language code (detected from the first 30 s if not given); `prompt` is the text before."""
         import torch
 
         extract = self.processor.feature_extractor  # type: ignore[attr-defined]  # set by ProcessorMixin
@@ -466,5 +451,5 @@ class STT:
         return self.processor.batch_decode(tokens, skip_special_tokens=True)[0].strip(), language
 
 
-# mypy ignores class decorators (python/mypy#3135), so it sees STT as the plain class rather than a Deployment
+# mypy ignores class decorators (python/mypy#3135)
 app = cast(serve.Deployment, STT).bind(settings())

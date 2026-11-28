@@ -1,9 +1,6 @@
-"""Ray Serve meeting notes: the page that transcribes a meeting live, relaying its audio to serve_stt's stream.
+"""Ray Serve meeting notes: a page that transcribes a meeting live, relaying its audio to serve_stt's stream.
 
-`GET /` (meeting.html), `GET /health`, and a WebSocket at `/api/stream` that opens STT's `audio/stream` with a bearer
-token and relays messages both ways unchanged, so the events are STT's. It holds no models, so replicas need a CPU and
-the system Python only, like serve_chat; a page change redeploys this app instead of reloading Whisper. Access control
-belongs to the deployment in front, as for the other apps.
+`GET /` (meeting.html), `GET /health`, WebSocket `/api/stream`. CPU-only, so a page change redeploys without Whisper.
 """
 
 import asyncio
@@ -29,8 +26,7 @@ ROOT = Path(__file__).resolve().parent
 VERSION_FILE = ROOT.parent / "VERSION"  # written by the image build, shared by all the apps
 VERSION = VERSION_FILE.read_text().strip() if VERSION_FILE.exists() else "dev"
 BACKEND_TIMEOUT = 10  # for opening STT's stream; the stream itself has no deadline
-# For STT's /health, which the page waits on while STT hasn't answered yet (e.g. while Whisper loads): the page then
-# loads without the language list instead of hanging.
+# for STT's /health; past it the page loads without the language list
 HEALTH_TIMEOUT = 2
 MAX_EVENT_BYTES = 1024 * 1024  # STT's events are small JSON objects
 
@@ -56,7 +52,7 @@ def reply(status, body, media_type="application/json"):
 
 
 def settings():
-    """Replica settings, read on the head and passed through bind(), as in serve_chat."""
+    """Replica settings, read on the head and passed through bind()."""
     env = os.environ.get
     return {
         "stt_url": env("MEETING_STT_URL", "http://localhost:8000/v1").rstrip("/"),
@@ -84,7 +80,7 @@ def close_code(code):
 
 @serve.deployment(
     num_replicas=int(os.environ.get("MEETING_NUM_REPLICAS", "1")),
-    # A meeting is one WebSocket held for as long as it lasts and mostly waits on STT, so a replica holds many.
+    # Meetings mostly wait on STT, so a replica holds many.
     max_ongoing_requests=int(os.environ.get("MEETING_MAX_ONGOING_REQUESTS", "16")),
 )
 @serve.ingress(api)
@@ -99,7 +95,7 @@ class Meeting:
             return json.loads(response.read())
 
     def stt_languages(self):
-        """Whisper's languages for the page's menu, read from STT once it answers; until then each page asks again."""
+        """Whisper's languages for the page's menu, cached once STT answers."""
         if self.languages is None:
             try:
                 languages = self.stt_health().get("languages")
@@ -124,8 +120,7 @@ class Meeting:
 
     @api.websocket("/api/stream")
     async def stream(self, websocket: WebSocket):
-        """STT's `audio/stream`, relayed: the page's messages go to STT and STT's events come back as they are, and
-        when either side closes the other is closed too. STT's close code and reason reach the page."""
+        """Relay between the page and STT's `audio/stream`, unchanged; either side closing closes the other."""
         await websocket.accept()
         url = stream_url(self.config["stt_url"], websocket.query_params.get("language", ""))
         try:
@@ -182,5 +177,5 @@ class Meeting:
                 stt.transport.abort()  # in case the close was cancelled, e.g. as the page went away; else a no-op
 
 
-# mypy ignores class decorators (python/mypy#3135), so it sees Meeting as the plain class rather than a Deployment
+# mypy ignores class decorators (python/mypy#3135)
 app = cast(serve.Deployment, Meeting).bind(settings())

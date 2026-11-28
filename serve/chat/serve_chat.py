@@ -1,12 +1,7 @@
 """Ray Serve voice chat: speech -> STT -> streamed LLM reply -> TTS per sentence, streamed back to the browser.
 
-Port of site-up's media/voice-chat with the same HTTP surface: `GET /` (chat.html), `GET /health`, `GET /api/voices`,
-and `POST /api/chat` answering NDJSON events. It holds no models: STT, the LLM, and TTS are URLs (all OpenAI-style `/v1`
-APIs), so replicas need a CPU and the system Python only. The pipeline is the original's: worker threads talk to the
-backends with http.client, and an interrupted turn shuts their sockets. What changed is the server (a FastAPI ingress
-instead of http.server, with Serve cancelling the response when the client disconnects), settings (read on the head and
-passed through bind()), and the client-IP allowlist, which is gone: access control belongs to the deployment in front,
-as for TTS and STT.
+`GET /` (chat.html), `GET /health`, `GET /api/voices`, `POST /api/chat` (NDJSON events). STT, the LLM and TTS are
+OpenAI-style URLs, so replicas are CPU-only. Worker threads call them; an interrupt shuts their sockets.
 """
 
 import asyncio
@@ -48,16 +43,15 @@ SYSTEM_PROMPT = (
 HISTORY_MESSAGES = 20  # earlier turns are dropped so prompt processing stays short
 MAX_REQUEST_BYTES = 10 * 1024 * 1024
 BACKEND_TIMEOUT = 120
-# Ray Serve answers 503 (or 429) while TTS is busy, such as during a txt2m4b run; wait this long for a slot.
+# how long to wait out a busy TTS (503/429)
 TTS_BUSY_WAIT = 20
 TTS_BUSY_STATUSES = (429, 503)
 TTS_SAMPLE_RATE = 24000  # OpenAI's pcm rate, for a TTS that doesn't send X-Sample-Rate
 POOL_IDLE_PER_ORIGIN = 8  # idle keep-alive connections kept per backend; more are closed
 DRAIN_TIMEOUT = 5  # how long to wait for the rest of a TTS stream after its `done` before giving up on reuse
 
-# A chunk ends at sentence punctuation; ASCII stops need a following space so "3.14" stays whole. The first chunk may
-# also end at a comma once it is long enough, so playback starts sooner, and so may any chunk that grows too long.
-# The full-width marks are CJK punctuation, deliberately (RUF001).
+# Chunks end at sentence stops (ASCII ones before a space, so "3.14" stays whole), or at a comma when long or
+# first, so playback starts sooner. Full-width marks are CJK punctuation (RUF001).
 HARD_STOPS = set("。！？；…\n")  # noqa: RUF001
 SOFT_STOPS = set(".!?;")
 PAUSES = set("，,、：:")  # noqa: RUF001
@@ -98,7 +92,7 @@ def reply(status, body, media_type="application/json"):
 
 
 def settings():
-    """Replica settings, read where Serve builds the app (the head) and passed through bind(), as in serve_tts."""
+    """Replica settings, read on the head and passed through bind()."""
     env = os.environ.get
     return {
         "stt_url": env("CHAT_STT_URL", "http://localhost:5005/v1").rstrip("/"),
@@ -114,14 +108,14 @@ def settings():
 
 
 def spoken(text):
-    """Text with the markdown, links, and emoji the model still sometimes writes removed, for TTS."""
+    """Strip markdown, links and emoji before TTS."""
     for pattern, replacement in MARKDOWN:
         text = pattern.sub(replacement, text)
     return text.strip()
 
 
 class Chunker:
-    """Splits streamed LLM text into chunks small enough to synthesize while the rest is still generating."""
+    """Split streamed LLM text into chunks to synthesize while the rest generates."""
 
     def __init__(self):
         self.buffer, self.first = "", True
@@ -163,10 +157,9 @@ class BackendError(Exception):
 
 
 class Pool:
-    """Idle keep-alive backend connections, shared by a replica's turns.
+    """Idle keep-alive backend connections shared by a replica's turns, saving a TLS handshake per call.
 
-    Every STT call and TTS sentence used to open its own connection, and through an HTTPS Gateway the TLS handshake
-    was most of each call's overhead. A connection goes back here only after its response was read to the end.
+    A connection comes back only after its response was read to the end.
     """
 
     def __init__(self):
@@ -209,8 +202,7 @@ def alive(connection):
         return False
 
 
-# What a request on a pooled connection the server has already closed fails with; a timeout is not one of them, since
-# the server may still be working on the request.
+# Errors from a pooled connection the server already closed; not timeouts, since the server may still be working.
 STALE = (ConnectionError, http.client.BadStatusLine)
 
 
@@ -228,8 +220,7 @@ class Turn:
         self.loop, self.tokens, self.pool = loop, tokens, pool
         self.events: asyncio.Queue[dict] = asyncio.Queue()
         self.cancelled = threading.Event()
-        # Each connection's socket, kept here because http.client drops `connection.sock` in getresponse() when the
-        # response closes the connection (HTTP/1.0, `Connection: close`) while the response still reads from it.
+        # Sockets kept here: http.client drops `connection.sock` on `Connection: close` while the response still reads.
         self.connections: dict[http.client.HTTPConnection, tuple[socket.socket, object]] = {}
         self.lock = threading.Lock()
 
@@ -315,8 +306,7 @@ def tts_get(pool, config, path):
 
 
 async def read_body(request, limit):
-    """The request body, refused past `limit` bytes before reading them when Content-Length says so, and while reading
-    them otherwise (chunked uploads), so an oversized upload is never held in memory whole."""
+    """The request body, refused past `limit` bytes without holding an oversized upload in memory."""
     too_large = ValueError(f"Request must be between 1 and {limit} bytes")
     declared = request.headers.get("content-length")
     if declared is not None and (not declared.isdigit() or int(declared) > limit):
@@ -414,11 +404,7 @@ def run_llm(config, turn, messages, chunks):
 
 
 def run_tts(config, turn, chunks, voice, language):
-    """Synthesize chunks one at a time, in order, since a TTS replica serves one request at a time.
-
-    Each chunk is requested as an SSE stream of 16-bit PCM and its audio forwarded piece by piece as it is generated,
-    so playback starts about a second into the chunk instead of after all of it.
-    """
+    """Synthesize chunks in order, one at a time, each streamed as PCM over SSE so playback starts early."""
     failed = False
     try:
         index = 0
@@ -460,8 +446,7 @@ def run_tts(config, turn, chunks, voice, language):
 
 
 def finish(connection, response):
-    """Read the rest of a stream after its last event (the chunked end), so its connection can go back to the pool
-    and TTS sees the stream finish instead of an abandoned one."""
+    """Read a stream to its chunked end so the connection is reusable and TTS doesn't see it abandoned."""
     with contextlib.suppress(OSError, http.client.HTTPException, ValueError):
         if connection.sock is not None:
             connection.sock.settimeout(DRAIN_TIMEOUT)
@@ -469,9 +454,7 @@ def finish(connection, response):
 
 
 def stream_tts(turn, response, index, text):
-    """Forward each streamed piece of 16-bit PCM as an `audio` event; the chunk's text rides on its first piece.
-
-    True once the stream's `speech.audio.done` arrives, False when the turn was cancelled first."""
+    """Forward each PCM piece as an `audio` event, text on the first; False if the turn was cancelled."""
     sample_rate = int(response.getheader("X-Sample-Rate") or TTS_SAMPLE_RATE)
     part = 0
     for line in response:
@@ -512,8 +495,7 @@ def reply_language(text, detected=None):
 
 
 def system_prompt(prompt, language):
-    """The system prompt with this turn's reply language, which a small model otherwise drops once the history
-    holds a reply in another language and copies that pattern instead."""
+    """The system prompt with this turn's reply language; small models otherwise copy the history's."""
     if language:
         return f"{prompt}\nThe user's latest message is in {language.capitalize()}; reply in {language.capitalize()}."
     return f"{prompt}\nReply in the language of the user's latest message, whatever language earlier turns used."
@@ -540,7 +522,7 @@ def line(event):
 
 @serve.deployment(
     num_replicas=int(os.environ.get("CHAT_NUM_REPLICAS", "1")),
-    # Each turn is one streamed request that mostly waits on STT, the LLM, and TTS, so a replica holds many at once.
+    # Turns mostly wait on backends, so a replica holds many.
     max_ongoing_requests=int(os.environ.get("CHAT_MAX_ONGOING_REQUESTS", "16")),
 )
 @serve.ingress(api)
@@ -551,7 +533,7 @@ class Chat:
         self.languages = None  # TTS's languages, read from its /health on first use
 
     def tts_languages(self):
-        """Languages the TTS service accepts, read from its /health once it answers; until then each turn asks again."""
+        """TTS's languages from its /health, cached once it answers."""
         if self.languages is None:
             try:
                 health = tts_get(self.pool, self.config, "/health")
@@ -673,5 +655,5 @@ class Chat:
                 logger.info("POST /api/chat interrupted: client disconnected")
 
 
-# mypy ignores class decorators (python/mypy#3135), so it sees Chat as the plain class rather than a Deployment
+# mypy ignores class decorators (python/mypy#3135)
 app = cast(serve.Deployment, Chat).bind(settings())

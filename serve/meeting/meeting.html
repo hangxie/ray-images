@@ -57,8 +57,7 @@ const $ = id => document.getElementById(id);
 const TARGET_RATE = 16000;
 let ctx, recorder, wakeLock = null;
 const meter = {at: 0, peak: 0};
-// A meeting streams the microphone to api/stream, which hands it to STT; STT cuts it at pauses and sends back
-// timestamped pieces of text, and pieces join into paragraphs. null when off.
+// The running stream to api/stream (STT), or null when off.
 let meeting = null;
 // The transcript survives a reload: [{at, text, meta, segments: [{start, end, text}]}], times in ms since the epoch.
 let transcript = JSON.parse(localStorage.getItem('transcript') || '[]');
@@ -86,8 +85,7 @@ function entry(text, meta, className = 'entry') {
   return {div, text: div.firstChild, meta: small};
 }
 
-// Whisper's languages, English name (and aliases such as mandarin) -> code, filled in by the server from STT's
-// /health; empty while STT is unreachable, and then Other… falls back to auto-detect.
+// Whisper's languages, name -> code, from STT's /health; empty while STT is down (Other… then auto-detects).
 const LANGUAGE_CODES = {{LANGUAGES}};
 const KNOWN = new Set([...Object.keys(LANGUAGE_CODES), ...Object.values(LANGUAGE_CODES)]);
 $('languages').replaceChildren(...Object.keys(LANGUAGE_CODES).sort().map(name => new Option(name)));

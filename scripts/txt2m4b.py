@@ -148,8 +148,7 @@ def write_dir(parts, path, part_re):
             raise SystemExit(f"error: {path} is not empty")
     except OSError as exc:
         raise SystemExit(f"error: {exc}") from exc
-    # Only a part's first chapter can have text before it, so text before a later chapter starts a new part. That
-    # happens to front matter chapters, which the text mode files under the first part.
+    # A part has one PPP-0000.txt, so text before a later chapter (front matter, say) starts a new part.
     split: list[list[list]] = []
     for _, chs in parts:
         split.append([[], []])
@@ -289,8 +288,8 @@ def build(chapters, files, title, output, audio_comment, args):
         meta += [f"artist={escape(args.author)}", f"album_artist={escape(args.author)}"]
     meta.append("")
     multi_part = len({c["part"] for c in chapters}) > 1
-    # Each chapter file starts with encoder priming that its own duration excludes. Stream copy keeps it, so the
-    # concat list and chapter marks use packet spans; file durations would overlap packets and drift per chapter.
+    # Stream copy keeps each chapter's encoder priming, which its duration excludes, so chapter marks use packet
+    # spans; file durations would drift per chapter.
     lines, start, part, elapsed = [], 0, object(), 0.0
     for chapter, path in zip(chapters, files, strict=True):
         seconds = span(path)
@@ -439,8 +438,7 @@ def main():
     files = {}
     names = {id(c): f"{i:03d}-{j:03d}.m4a" for i, _, chs in selected for j, c in enumerate(chs, 1)}
     todo = [c for _, _, chs in selected for c in chs]
-    # Chapters whose cached file was made with the same settings and text are reused. The model is left out of the
-    # comparison: endpoints name the same model differently, and which of them answer varies between runs.
+    # Reuse cached chapters with the same settings and text; the model isn't compared, endpoints name it differently.
     pending = []
     for k, c in enumerate(todo, 1):
         path = os.path.join(workdir, names[id(c)])
@@ -451,9 +449,7 @@ def main():
             pending.append((f"[{k}/{len(todo)}] {c['title']}", c, path, comment))
     if pending:
         print(f"{len(todo) - len(pending)} of {len(todo)} chapters cached; synthesizing {len(pending)}")
-        # One queue spans all chapters, so endpoints never idle at a chapter's end. Each chapter is encoded on the
-        # CPU as soon as its last paragraph arrives; waiting for the previous encode bounds the PCM held to two
-        # chapters.
+        # one queue across chapters; each is encoded when done, holding at most two chapters of PCM
         with tempfile.TemporaryDirectory() as tmp, concurrent.futures.ThreadPoolExecutor(1) as encoder_pool:
             chapter_jobs = []
             for k, (label, c, _, _) in enumerate(pending):
