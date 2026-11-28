@@ -4,9 +4,8 @@
   ./txt2mp3.py notes.txt                        # writes notes.mp3
   ./txt2mp3.py notes.txt narration.mp3 --voice hang-zh --language chinese
 
-Each non-empty line is a paragraph, synthesized separately, kept at the model's native mono 24 kHz, and followed by
---pause seconds of silence. Paragraphs are spread over every endpoint in the endpoint config (see tts_client.py). The
-MP3's comment tag records the server model, voice, language, speed, pause and sampling settings.
+Each non-empty line is a paragraph, followed by --pause seconds of silence. Paragraphs are spread over the
+configured endpoints (see tts_client.py). The MP3's comment tag records the model and settings.
 """
 
 import argparse

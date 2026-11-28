@@ -8,15 +8,14 @@
   ./txt2m4b.py book.txt --split book/           # write the detected chapters as files to check and fix by hand
   ./txt2m4b.py book/ --title 朱雀记              # narrate a directory of chapter files
 
-Each non-empty line is a paragraph, as in txt2mp3.py. A short line that starts like a part heading (第一部, Part 1)
-or a chapter heading (第一章, Chapter 1, 序章, 后记, Prologue) starts a new part or chapter; override the patterns with
---part-regex/--chapter-regex. The input may instead be a directory of PPP-CCCC.txt files, ordered by part and chapter
-number, with the chapter title on the first line; an optional PPP-0000.txt names the part on its first line and is
-read before that part's first chapter, and 000-0000.txt holds front matter read before the first chapter.
-Paragraphs are spread over every endpoint in the endpoint config (see tts_client.py) in book order across chapter
-boundaries. Each finished chapter is encoded into a tagged HE-AAC file under the work
-directory while later ones are synthesized, and reused on the next run while its text and settings are unchanged, so
-an interrupted book resumes at the chapter it stopped in. The m4b joins the chapter files without re-encoding.
+Each non-empty line is a paragraph. A short line starting like a part heading (第一部, Part 1) or a chapter heading
+(第一章, Chapter 1, 序章, 后记, Prologue) starts one; see --part-regex/--chapter-regex.
+
+A directory input holds PPP-CCCC.txt files with the chapter title on the first line. An optional PPP-0000.txt names
+the part and is read before its first chapter; 000-0000.txt is front matter.
+
+Paragraphs are spread over the configured endpoints (see tts_client.py). Each chapter is encoded to HE-AAC under the
+work directory and reused while its text and settings are unchanged, so an interrupted run resumes.
 """
 
 import argparse

@@ -1,7 +1,4 @@
-"""serve_tts's HTTP surface (its page, voice chat and txt2mp3/txt2m4b depend on it), on a replica with a fake model.
-
-The routes, request validation, generate() and generate_stream() are the real ones; only Qwen3TTSModel is replaced.
-"""
+"""serve_tts's HTTP surface on a replica with a fake Qwen3TTSModel."""
 
 import asyncio
 import base64
@@ -315,8 +312,7 @@ def sse(response):
 
 
 def streaming_replica(voices_dir, tiny_decoder, frames=30, error=None):
-    """A replica whose talker hands over `frames` random codec frames, as the hooks do during generate_voice_clone,
-    then finishes, or raises `error` after them."""
+    """A replica whose talker streams `frames` random codec frames, then finishes or raises `error`."""
     replica = make_replica(voices_dir, FakeTTS(tiny_decoder))
     generated = torch.randint(0, 32, (frames, CODE_GROUPS))
 

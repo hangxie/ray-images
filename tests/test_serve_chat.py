@@ -1,8 +1,4 @@
-"""serve_chat's routes and turn pipeline against fake STT, LLM, and TTS servers on loopback.
-
-Everything but the backends is real: the FastAPI routes, the worker threads and their http.client requests, chunking,
-and cancellation.
-"""
+"""serve_chat's routes and turn pipeline, all real, against fake STT, LLM and TTS servers on loopback."""
 
 import asyncio
 import base64

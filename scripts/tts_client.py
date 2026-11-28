@@ -10,8 +10,7 @@ URL is the app's base, with or without `/v1`. Endpoints come from a TOML file (-
   token_env = "TTS_TOKEN_K8S"     # or token_file = "...", or token = "..."
   slots     = 2
 
-Each endpoint runs one worker per slot, all taking paragraphs from one queue in input order, so faster endpoints
-simply take more of them. Every endpoint is assumed to serve the same model and voices.
+One worker per slot, all on one queue, so faster endpoints take more paragraphs. Endpoints must share model and voices.
 """
 
 import collections

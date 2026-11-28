@@ -1,6 +1,4 @@
-"""cuda_graphs must stay equivalent to qwen-tts's eager path (AGENTS.md): on CPU the graph bodies run eagerly, so greedy
-codes through them must match HF generate on tiny random models. Capture and replay themselves need a GPU.
-"""
+"""cuda_graphs matches qwen-tts's eager path: on CPU the graph bodies run eagerly, so greedy codes must match."""
 
 import pytest
 import torch

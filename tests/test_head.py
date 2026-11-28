@@ -1,6 +1,4 @@
-"""What the head needs from the Serve apps: it imports them to build the applications, reads settings there and passes
-them through bind(), and pickles the FastAPI app. The model packages load only in TTS and STT replicas, so the head and
-the CPU-only chat and meeting replicas never import them."""
+"""What the head needs: apps import without model packages, settings go through bind(), and the app pickles."""
 
 import os
 import subprocess
@@ -58,8 +56,7 @@ def test_apps_import_without_replica_packages():
 
 @pytest.mark.parametrize("module", [serve_tts, serve_stt, serve_chat, serve_meeting])
 def test_app_pickles(module):
-    """Serve pickles the ingress app and the replica class, so nothing unpicklable (e.g. threading.local) may live at
-    module level. The ingress wrapper is a dynamic subclass, so it goes by value with the globals its methods use."""
+    """Serve pickles the ingress app and replica class by value with their globals: nothing unpicklable there."""
     restored = cloudpickle.loads(cloudpickle.dumps(module.api))
     assert {r.path for r in restored.routes} == {r.path for r in module.api.routes}
     cloudpickle.loads(cloudpickle.dumps(module.app._bound_deployment.func_or_class))

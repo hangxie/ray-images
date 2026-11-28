@@ -1,7 +1,4 @@
-"""serve_stt's OpenAI-compatible transcription API and live stream, on a replica with a fake Whisper.
-
-The routes, multipart parsing, audio loading, segmenting and validation are the real ones; transcribe() needs CUDA.
-"""
+"""serve_stt's transcription API and live stream, on a replica with a fake Whisper."""
 
 import asyncio
 import json
@@ -179,7 +176,7 @@ def test_multipart_fields_keeps_binary_payload():
 
 
 def test_page_uses_relative_urls(client):
-    """A plain recording page; meeting notes and anything fancier are serve_meeting's, so they don't reload Whisper."""
+    """A plain recording page; live features belong to serve_meeting."""
     response = client.get("/")
     assert response.status_code == 200
     assert response.headers["content-type"] == "text/html; charset=utf-8"
@@ -268,8 +265,7 @@ CLIP = Path(__file__).with_name("data") / "speech.flac"  # two sentences 0.5 s a
 
 
 def music(seconds, level_db, rng):
-    """Background music with a beat: chords that swell on every beat over a quiet pad, and a hi-hat between beats.
-    Loudness alone took this for continuous speech."""
+    """Music with a beat, which a loudness detector took for continuous speech."""
     t = np.arange(round(seconds * 16000)) / 16000
     chords = [(220.0, 277.2, 329.6), (196.0, 246.9, 293.7), (174.6, 220.0, 261.6), (196.0, 246.9, 293.7)]
     bar = (t // 2).astype(int) % len(chords)

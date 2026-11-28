@@ -1,8 +1,4 @@
-"""serve_tts's hooks into qwen-tts internals, against tiny random models of the installed qwen-tts on CPU.
-
-These are the checks AGENTS.md asks to rerun when upgrading qwen-tts or transformers: the talker hooks, and
-decode_tail / Streamer matching the full-clip decode.
-"""
+"""serve_tts's hooks into qwen-tts internals on tiny models; rerun when upgrading qwen-tts or transformers."""
 
 import numpy as np
 import pytest

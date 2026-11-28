@@ -1,9 +1,5 @@
-"""Shared fixtures: tiny random qwen-tts models on CPU, stand-ins for the CUDA calls replicas make, and fake replicas.
-
-The real checkpoints and GPUs only exist on the cluster. The tiny models keep qwen-tts's architecture (talker, code
-predictor, speech-tokenizer decoder at its real upsampling rates) with a few dozen hidden units, so the code that
-reaches into qwen-tts internals runs against the installed version here.
-"""
+"""Shared fixtures: tiny random qwen-tts models on CPU (the real architecture, few hidden units), CUDA stand-ins
+and fake replicas."""
 
 import io
 from types import SimpleNamespace
@@ -13,8 +9,8 @@ import pytest
 import soundfile as sf
 import torch
 
-# Talker vocabulary: codec codes, then 1024 special tokens that generate suppresses except end-of-speech, as in the
-# released checkpoints. Codes stay below CODEBOOK so they double as code-predictor and decoder tokens.
+# Talker vocabulary as released: codes, then 1024 suppressed specials but end-of-speech. Codes < CODEBOOK serve as
+# code-predictor and decoder tokens too.
 CODEBOOK = 32
 VOCAB = CODEBOOK + 1024
 EOS = CODEBOOK + 10

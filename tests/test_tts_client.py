@@ -1,5 +1,4 @@
-"""scripts/tts_client.py (txt2mp3's and txt2m4b's client) against serve_tts's real routes, with a fake model, served on
-loopback by uvicorn."""
+"""scripts/tts_client.py against serve_tts's real routes (fake model) on loopback."""
 
 import socket
 import threading
